@@ -13,18 +13,15 @@ from methylbert.data.vocab import MethylVocab
 
 
 def _line2tokens_pretrain(l, tokenizer, max_len=120):
-	'''
-		convert a text line into a list of tokens converted by tokenizer
-
-	'''
-
-	l = l.strip().split(" ")
-
-	tokened = [tokenizer.to_seq(b) for b in l]
-	if len(tokened) > max_len:
-		return tokened[:max_len]
-	else:
-		return tokened + [[tokenizer.pad_index] for k in range(max_len-len(tokened))]
+    '''
+        convert a text line into a list of tokens converted by tokenizer
+    '''
+    l = l.strip().split(" ")
+    tokened = tokenizer.to_seq(l)
+    if len(tokened) > max_len:
+        return tokened[:max_len]
+    else:
+        return tokened + [tokenizer.pad_index for _ in range(max_len - len(tokened))]
 
 def _parse_line(l, headers):
 	# Check the header
