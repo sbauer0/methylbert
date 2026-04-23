@@ -7,6 +7,7 @@ from functools import partial
 import numpy as np
 import pandas as pd
 import torch
+import os
 from torch.utils.data import Dataset
 
 from methylbert.data.vocab import MethylVocab
@@ -288,3 +289,120 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 
 		return item
 
+import json
+import glob
+from pathlib import Path
+
+
+class MethylBertPretrainDatasetBinary(MethylBertDataset):
+    def __init__(self, data_dir: str, vocab: MethylVocab, seq_len: int,
+                 random_len: bool = False):
+        '''
+            Memory-mapped pretraining dataset that reads tokenized int16 binary
+            files produced by pretrain_data_preprocess_5base_binary.
+
+            Expects data_dir to contain matching .bin / .json file pairs.
+            Each .bin file is a flat int16 array of shape (n_reads, seq_len).
+            The .json sidecar holds the n_reads count and seq_len.
+
+            data_dir : str
+                Directory containing .bin and .json file pairs.
+            vocab : MethylVocab
+                Vocabulary. Must match the vocab used during preprocessing.
+            seq_len : int
+                Sequence length. Must match the seq_len used during
+                preprocessing.
+            random_len : bool
+                If True, randomly truncate sequences to simulate variable
+                read lengths during training. Default: False.
+        '''
+        self.vocab = vocab
+        self.seq_len = seq_len
+        self.random_len = random_len
+        self.data_dir = data_dir
+
+        # Define a range of tokens to mask based on k-mers (same as text version)
+        self.mask_list = self._get_mask()
+
+        # Discover .bin / .json pairs
+        json_files = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+        if len(json_files) == 0:
+            raise FileNotFoundError(f"No .json metadata files found in {data_dir}")
+
+        self.memmaps = []
+        self.offsets = [0]   # cumulative read counts per shard
+        total_reads = 0
+
+        for f_json in json_files:
+            with open(f_json, "r") as f:
+                meta = json.load(f)
+            f_bin = f_json.replace(".json", ".bin")
+            if not os.path.exists(f_bin):
+                raise FileNotFoundError(f"Binary file missing for {f_json}: {f_bin}")
+            if meta["seq_len"] != seq_len:
+                raise ValueError(
+                    f"seq_len mismatch in {f_json}: "
+                    f"metadata says {meta['seq_len']}, dataset expects {seq_len}"
+                )
+            if meta["vocab_size"] != len(vocab):
+                raise ValueError(
+                    f"vocab_size mismatch in {f_json}: "
+                    f"metadata says {meta['vocab_size']}, vocab has {len(vocab)}"
+                )
+
+            mm = np.memmap(f_bin, dtype=np.int16, mode="r",
+                           shape=(meta["n_reads"], seq_len))
+            self.memmaps.append(mm)
+            total_reads += meta["n_reads"]
+            self.offsets.append(total_reads)
+
+        self.total_reads = total_reads
+        print(f"Loaded {len(self.memmaps)} shards, {self.total_reads:,} total reads.")
+
+    def __len__(self):
+        return self.total_reads
+
+    def _locate(self, index: int):
+        '''
+            Map a global index to (shard_idx, local_idx) within that shard.
+        '''
+        # binary search over cumulative offsets
+        import bisect
+        shard_idx = bisect.bisect_right(self.offsets, index) - 1
+        local_idx = index - self.offsets[shard_idx]
+        return shard_idx, local_idx
+
+    def __getitem__(self, index):
+        shard_idx, local_idx = self._locate(index)
+
+        # Copy the row out of the memmap into an independent tensor so
+        # downstream mutations (masking) don't touch the mmap.
+        dna_seq = torch.tensor(
+            np.array(self.memmaps[shard_idx][local_idx], dtype=np.int16),
+            dtype=torch.int16
+        )
+
+        # Random length truncation (optional)
+        if self.random_len and np.random.random() < 0.5:
+            dna_seq = dna_seq[:random.randint(5, self.seq_len)]
+
+        # Padding if truncation shortened the sequence
+        if dna_seq.shape[0] < self.seq_len:
+            pad_num = self.seq_len - dna_seq.shape[0]
+            dna_seq = torch.cat((
+                dna_seq,
+                torch.tensor([self.vocab.pad_index] * pad_num, dtype=torch.int16)
+            ))
+
+        # Apply MLM masking (reuses logic from the text-based class)
+        masked_dna_seq, dna_seq, bert_mask = self._masking(dna_seq)
+
+        return {
+            "bert_input": masked_dna_seq,
+            "bert_label": dna_seq,
+            "bert_mask": bert_mask
+        }
+
+    # --- Reuse the masking logic unchanged from MethylBertPretrainDataset ---
+    _get_mask = MethylBertPretrainDataset._get_mask
+    _masking = MethylBertPretrainDataset._masking
