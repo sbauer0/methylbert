@@ -181,7 +181,11 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
         pass
 
     def create_model(self, *args, **kwargs):
-        config = BertConfig(vocab_size = len(self.train_data.dataset.vocab), *args, **kwargs)
+        # Handle Subset wrapping from random_split
+        dataset = self.train_data.dataset
+        while hasattr(dataset, 'dataset'):  # unwrap Subset/ConcatDataset/etc
+            dataset = dataset.dataset
+        config = BertConfig(vocab_size=len(dataset.vocab), *args, **kwargs)
         self.bert = BertForMaskedLM(config)
         self._setup_model()
 
@@ -205,8 +209,8 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
             with torch.no_grad():
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
                                     enabled=self._config.amp):
-                        mask_lm_output = self.model.forward(input_ids = data["input"],
-                                                        masked_lm_labels = data["label"])
+                        mask_lm_output = self.model.forward(input_ids=data["bert_input"],
+                                                            labels=data["bert_label"])
 
                 mean_loss += mask_lm_output[0].mean().item()/len(data_loader)
                 predict_res["prediction"].append(np.argmax(mask_lm_output[1].cpu().detach(), axis=-1))
@@ -284,8 +288,8 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
 
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
                                     enabled=self._config.amp):
-                    mask_lm_output = self.model.forward(input_ids = data["bert_input"],
-                                                masked_lm_labels = data["bert_label"])
+                    mask_lm_output = self.model.forward(input_ids=data["bert_input"],
+                                                        labels=data["bert_label"])
 
                 loss = mask_lm_output[0]
 
@@ -334,10 +338,10 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                         print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
 
-                    if self.min_loss > global_step_loss:
-                        print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
-                        self.save(self.save_path)
-                        self.min_loss = global_step_loss
+                    #if self.min_loss > global_step_loss:
+                    #    print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
+                    #    self.save(self.save_path)
+                    #    self.min_loss = global_step_loss
 
                     # Save the step info (step, loss, lr, acc)
                     with open(self.f_train, "a") as f_perform:
