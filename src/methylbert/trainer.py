@@ -214,9 +214,9 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
 
                 mean_loss += mask_lm_output[0].mean().item()/len(data_loader)
                 predict_res["prediction"].append(np.argmax(mask_lm_output[1].cpu().detach(), axis=-1))
-                predict_res["input"].append(data["input"].cpu().detach())
-                predict_res["label"].append(data["label"].cpu().detach())
-                predict_res["mask"].append(data["mask"].cpu().detach())
+                predict_res["input"].append(data["bert_input"].cpu().detach())
+                predict_res["label"].append(data["bert_label"].cpu().detach())
+                predict_res["mask"].append(data["bert_mask"].cpu().detach())
 
             if self._config.eval:
                 print("Batch %d/%d is done...."%(i, len(data_loader)))
