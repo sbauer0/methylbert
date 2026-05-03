@@ -129,7 +129,7 @@ class MethylVocab(object):
         self.kmers=k
 
         # Create a look up table with 3-mer tokens
-        bases = ["A","G","T","C", "M"]
+        bases = ["A","G","T","C"]
 
         vocabs = list(itertools.product(bases, repeat=self.kmers))
         vocabs = sorted(["".join(e) for e in vocabs]) #alphabetical orders
