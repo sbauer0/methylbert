@@ -3,12 +3,22 @@ import multiprocessing as mp
 import random
 from copy import deepcopy
 from functools import partial
+import json
+import glob
+import os
+
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from methylbert.data.vocab import MethylVocab
+
+import bisect
+from methylbert.data.nanopore.featurize import (
+         STATE_NON_CPG,
+         STATE_UNKNOWN,
+        )
 
 
 def _line2tokens_pretrain(l, tokenizer, max_len=120):
@@ -286,3 +296,216 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		item["methyl_seq"] = torch.cat((torch.tensor([2]), item["methyl_seq"]))
 
 		return item
+
+
+class MethylBertPretrainDatasetBinary(MethylBertDataset):
+    """
+    Memory-mapped pretraining dataset that reads two-int binary shards
+    produced by methylbert.data.nanopore.preprocess.
+
+    Each shard in ``data_dir`` is three files sharing a basename:
+        <name>.tokens.bin  flat int16 array of shape (n_rows, window_len)
+        <name>.states.bin  flat int8  array of shape (n_rows, window_len)
+        <name>.json        sidecar with {n_rows, window_len, vocab_size, ...}
+
+    For each item, returns a dict:
+        bert_input  : (window_len + 1,) int  — DNA tokens after MLM corruption,
+                                                with SOS prepended and EOS at
+                                                the last non-pad position.
+        bert_label  : (window_len + 1,) int  — original DNA tokens at MLM-selected
+                                                positions, -100 elsewhere.
+        bert_mask   : (window_len + 1,) bool — True at MLM-selected positions
+                                                (used by the original MethylBERT
+                                                code; preserved for compatibility).
+        methyl_seq  : (window_len + 1,) int  — methylation states in {0, 1, 2, 3}.
+                                                Mirrors bert_input; per Option B,
+                                                MLM-selected positions are reset
+                                                to STATE_UNKNOWN to prevent the
+                                                CpG-context from leaking the
+                                                masked DNA token's identity.
+                                                SOS and EOS positions are
+                                                STATE_NON_CPG.
+    """
+
+    def __init__(self, data_dir: str, vocab: MethylVocab, seq_len: int,
+                 random_len: bool = False):
+        '''
+            data_dir : str
+                Directory containing matching .tokens.bin / .states.bin / .json
+                triples (as produced by the preprocessor driver). Other files
+                in the directory (e.g., manifest.tsv) are ignored.
+            vocab : MethylVocab
+                Vocabulary. Must match the vocab used during preprocessing.
+            seq_len : int
+                Window length (must match the value recorded in each shard's
+                JSON sidecar). Items returned by __getitem__ are seq_len + 1
+                long after SOS prepend.
+            random_len : bool
+                If True, randomly truncate sequences (and pad back) to simulate
+                variable read lengths during training. Default: False.
+        '''
+        self.vocab = vocab
+        self.seq_len = seq_len
+        self.random_len = random_len
+        self.data_dir = data_dir
+
+        # Same k-mer-aware mask expansion as the text-based dataset.
+        self.mask_list = self._get_mask()
+
+        # Discover shard JSON sidecars.
+        json_files = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+        if len(json_files) == 0:
+            raise FileNotFoundError(
+                f"No shard JSON files found in {data_dir}"
+            )
+
+        self.tokens_memmaps = []
+        self.states_memmaps = []
+        self.offsets = [0]   # cumulative row counts across shards
+        total_rows = 0
+
+        for f_json in json_files:
+            with open(f_json, "r") as f:
+                meta = json.load(f)
+
+            # Validate schema.
+            if "n_rows" not in meta or "window_len" not in meta:
+                raise ValueError(
+                    f"{f_json} does not look like a nanopore shard sidecar "
+                    f"(missing n_rows/window_len). Did you point at an old-format dir?"
+                )
+            if meta["window_len"] != seq_len:
+                raise ValueError(
+                    f"window_len mismatch in {f_json}: "
+                    f"metadata says {meta['window_len']}, dataset expects {seq_len}"
+                )
+            if meta["vocab_size"] != len(vocab):
+                raise ValueError(
+                    f"vocab_size mismatch in {f_json}: "
+                    f"metadata says {meta['vocab_size']}, vocab has {len(vocab)}"
+                )
+
+            tokens_file = meta.get("tokens_file") or (
+                os.path.basename(f_json).replace(".json", ".tokens.bin")
+            )
+            states_file = meta.get("states_file") or (
+                os.path.basename(f_json).replace(".json", ".states.bin")
+            )
+            f_tokens = os.path.join(os.path.dirname(f_json), tokens_file)
+            f_states = os.path.join(os.path.dirname(f_json), states_file)
+            if not os.path.exists(f_tokens):
+                raise FileNotFoundError(
+                    f"Tokens file missing for {f_json}: {f_tokens}"
+                )
+            if not os.path.exists(f_states):
+                raise FileNotFoundError(
+                    f"States file missing for {f_json}: {f_states}"
+                )
+
+            n_rows = int(meta["n_rows"])
+            if n_rows == 0:
+                # Empty shard — skip without trying to memmap a zero-length file.
+                continue
+
+            mm_tokens = np.memmap(f_tokens, dtype=np.int16, mode="r",
+                                  shape=(n_rows, seq_len))
+            mm_states = np.memmap(f_states, dtype=np.int8, mode="r",
+                                  shape=(n_rows, seq_len))
+            self.tokens_memmaps.append(mm_tokens)
+            self.states_memmaps.append(mm_states)
+            total_rows += n_rows
+            self.offsets.append(total_rows)
+
+        self.total_rows = total_rows
+        print(f"Loaded {len(self.tokens_memmaps)} shards, "
+              f"{self.total_rows:,} total rows.")
+
+    def __len__(self):
+        return self.total_rows
+
+    def _locate(self, index: int):
+        '''Map a global index to (shard_idx, local_idx) within that shard.'''
+        shard_idx = bisect.bisect_right(self.offsets, index) - 1
+        local_idx = index - self.offsets[shard_idx]
+        return shard_idx, local_idx
+
+    def __getitem__(self, index):
+        shard_idx, local_idx = self._locate(index)
+
+        # Copy out of the memmap into independent tensors so that downstream
+        # mutations (masking, EOS placement) don't touch the mmap.
+        dna_seq = torch.tensor(
+            np.array(self.tokens_memmaps[shard_idx][local_idx], dtype=np.int16),
+            dtype=torch.int16,
+        )
+        methyl_seq = torch.tensor(
+            np.array(self.states_memmaps[shard_idx][local_idx], dtype=np.int8),
+            dtype=torch.int8,
+        )
+
+        # Optional random-length truncation (applied in lockstep to both arrays).
+        if self.random_len and np.random.random() < 0.5:
+            new_len = random.randint(5, self.seq_len)
+            dna_seq = dna_seq[:new_len]
+            methyl_seq = methyl_seq[:new_len]
+
+        # Pad back to seq_len if truncation shortened the sequence.
+        if dna_seq.shape[0] < self.seq_len:
+            pad_num = self.seq_len - dna_seq.shape[0]
+            dna_seq = torch.cat((
+                dna_seq,
+                torch.tensor([self.vocab.pad_index] * pad_num, dtype=torch.int16),
+            ))
+            methyl_seq = torch.cat((
+                methyl_seq,
+                torch.tensor([STATE_NON_CPG] * pad_num, dtype=torch.int8),
+            ))
+
+        # Compute the EOS position BEFORE calling _masking, so we can mark the
+        # methylation track at that position as STATE_NON_CPG. _masking computes
+        # the same value internally as `end` and overwrites dna_seq[end] with
+        # the EOS token; we just need the index.
+        non_pad_positions = (dna_seq != self.vocab.pad_index).nonzero(as_tuple=True)[0]
+        if len(non_pad_positions) > 0:
+            end_pos = non_pad_positions[-1].item()
+        else:
+            end_pos = dna_seq.shape[0] - 1   # all-pad sequence: shouldn't happen
+
+        # Apply MLM masking on DNA. Returns arrays of length seq_len + 1
+        # (one extra for the prepended SOS).
+        masked_dna_seq, dna_label, masked_index = self._masking(dna_seq)
+
+        # Build the methylation track parallel to masked_dna_seq.
+        # Prepend STATE_NON_CPG for the SOS slot (matching SOS position 0).
+        methyl_seq = torch.cat((
+            torch.tensor([STATE_NON_CPG], dtype=torch.int8),
+            methyl_seq,
+        ))
+
+        # Option B: at every position selected for the MLM objective, hide the
+        # methylation by setting it to STATE_UNKNOWN. This applies to all three
+        # MLM-substitution branches (80% [MASK], 10% random, 10% kept-original)
+        # because in all three the model is asked to predict at this position;
+        # leaving a 0/1 methylation visible would let the model use the
+        # CpG-context fact to narrow the masked-token prediction from 64 to 4
+        # (the XCG 3-mers).
+        methyl_seq[masked_index] = STATE_UNKNOWN
+
+        # Special-token positions: STATE_NON_CPG.
+        # SOS is at index 0 (already STATE_NON_CPG from the prepend, but explicit).
+        # EOS is at end_pos + 1 in the post-SOS-prepend array (one shifted right).
+        methyl_seq[0] = STATE_NON_CPG
+        eos_in_padded = end_pos + 1
+        if 0 <= eos_in_padded < methyl_seq.shape[0]:
+            methyl_seq[eos_in_padded] = STATE_NON_CPG
+
+        return {
+            "bert_input": masked_dna_seq,
+            "bert_label": dna_label,
+            "bert_mask": masked_index,
+            "methyl_seq": methyl_seq,
+        }
+
+    # Reuse the masking logic unchanged from MethylBertPretrainDataset.
+    _get_mask = MethylBertPretrainDataset._get_mask
+    _masking = MethylBertPretrainDataset._masking

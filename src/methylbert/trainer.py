@@ -210,6 +210,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
                                     enabled=self._config.amp):
                         mask_lm_output = self.model.forward(input_ids=data["bert_input"],
+                                                            token_type_ids=data["methyl_seq"].long(),
                                                             labels=data["bert_label"])
 
                 mean_loss += mask_lm_output[0].mean().item()/len(data_loader)
@@ -289,6 +290,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
                                     enabled=self._config.amp):
                     mask_lm_output = self.model.forward(input_ids=data["bert_input"],
+                                                        token_type_ids=data["methyl_seq"].long(),
                                                         labels=data["bert_label"])
 
                 loss = mask_lm_output[0]

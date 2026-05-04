@@ -1,0 +1,3 @@
+bam_path	mm_flag	reference_build	basecaller_version	mod_codes	cohort	sample_label
+/data/gidb/shared/datasets/MethylBERT/HG008/normal_duodenal_tissue/HG008-N-D_CHM13v2.0_ONT-R1041-dorado_0.5.3_5mC_5hmC_94x_pass.bam	.	CHM13v2.0	dorado_0.5.3	C+m,C+h	HG008	normal_duodenal
+/data/gidb/shared/datasets/MethylBERT/COLO829_BL/colo829/bam_filtered/PAU59949.d052sup4305mCG_5hmCGvHg38_pass.bam	?	hg38	dorado_0.5.2	C+m,C+h	COLO829	cancer
