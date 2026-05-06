@@ -1,0 +1,74 @@
+=== Job started: Mon May  4 09:04:15 PM CEST 2026 ===
+Host:           cc2g03.tnt.uni-hannover.de
+Slurm job ID:   2043806
+CPUs allocated: 64
+Mem allocated:  131072 MB
+Submitted from: /home/bauerste/Methylbert_methylation_encoding/methylbert/myNotebooks
+
+=== Environment check ===
+/home/bauerste/venvs/5basemethylbert/bin/python
+Python 3.11.15
+methylbert from: /home/bauerste/Methylbert_methylation_encoding/methylbert/src/methylbert/__init__.py
+pysam version: 0.22.1
+
+=== Inputs/outputs ===
+Manifest:    /home/bauerste/Methylbert_methylation_encoding/methylbert/myNotebooks/manifest.tsv
+Output dir:  /data/gidb/shared/datasets/MethylBERT/pretrain_shards_4state_v1
+
+=== Disk space on output filesystem ===
+Filesystem                     Size  Used Avail Use% Mounted on
+neptun:/phys/intern/data/gidb  153T  148T  5.6T  97% /data/gidb
+
+=== Starting preprocessing: Mon May  4 09:04:15 PM CEST 2026 ===
+Building Vocab
+
+==============================================================================
+ FINAL SUMMARY
+==============================================================================
+
+  HG008-N-D_CHM13v2.0_ONT-R1041-dorado_0.5.3_5mC_5hmC_94x_pass  (25 regions)
+    reads examined:               25,804,537
+    reads kept:                   25,804,537
+    windows written:             477,016,572
+    elapsed (max region):           37264.1s
+
+  HG008-N-P_CHM13v2.0_ONT-R1041-dorado_0.5.3_5mC_5hmC_41x_pass  (25 regions)
+    reads examined:                6,136,990
+    reads kept:                    6,136,990
+    windows written:             195,672,926
+    elapsed (max region):           17014.9s
+
+  HG008-T_CHM13v2.0_ONT-R10.4.1-doradov0.3.4-5mCG-5hmC_63x_UCSC_20230905_pass  (25 regions)
+    reads examined:                4,231,117
+    reads kept:                    4,231,117
+    windows written:             230,639,062
+    elapsed (max region):           21636.8s
+
+  PAU59949.d052sup4305mCG_5hmCGvHg38_pass  (25 regions)
+    reads examined:                5,891,929
+    reads kept:                    5,891,929
+    windows written:             250,849,086
+    elapsed (max region):           23951.8s
+
+  PAU61426.d052sup4305mCG_5hmCGvHg38_pass  (25 regions)
+    reads examined:                5,949,202
+    reads kept:                    5,949,202
+    windows written:             255,794,884
+    elapsed (max region):           24516.1s
+
+  PAU59807.d052sup4305mCG_5hmCGvHg38_pass  (25 regions)
+    reads examined:                7,141,618
+    reads kept:                    7,141,618
+    windows written:             303,455,751
+    elapsed (max region):           22395.8s
+
+  PAU61427.d052sup4305mCG_5hmCGvHg38_pass  (25 regions)
+    reads examined:                5,599,651
+    reads kept:                    5,599,651
+    windows written:             235,720,338
+    elapsed (max region):           17071.0s
+
+  TOTAL: 1,949,148,619 windows from 60,755,044 kept (60,755,044 examined) across 7 BAM(s).
+  Wall time (max single work item): 37264.1s
+
+=== Job finished: Tue May  5 07:25:23 AM CEST 2026 ===
