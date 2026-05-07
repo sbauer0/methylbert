@@ -70,27 +70,27 @@ test_loader = DataLoader(
 
 trainer = tr.MethylBertPretrainTrainer(
     vocab_size=len(vocab),
-    save_path="/home/bauerste/Methylbert_methylation_encoding/pretrained_model_2gpu",
+    save_path="/tmp/bauerste/Methylbert_methylation_encoding/pretrained_model_2gpu",
     train_dataloader=train_loader,
     test_dataloader=test_loader,
     lr=4e-4,
     warmup_step=10000,
     decrease_steps=180000,        # extended from 100k to fit a ~200k step budget
-    eval_freq=1000,
-    log_freq=100,
-    save_freq=5000,               # lowered from 10k for safer checkpointing
+    eval_freq=200,
+    log_freq=50,
+    save_freq=50,               # lowered from 10k for safer checkpointing
     amp=True,
     gradient_accumulation_steps=4,
 )
+trainer.device = torch.device(f"cuda:{local_rank}")
 
 trainer.create_model(type_vocab_size=4, num_hidden_layers=6)
+
 trainer.model = trainer.model.to(f"cuda:{local_rank}")
-# Wrap the freshly-created model in DDP. The trainer holds a reference to
-# self.model; we replace it with the DDP-wrapped version. Internal forward
-# calls delegate transparently.
+
 if world_size > 1:
     trainer.model = DDP(trainer.model, device_ids=[local_rank])
 
-trainer.train(steps=100)   # smoke test; bump to ~200000 for real run
+trainer.train(steps=51)   # smoke test; bump to ~200000 for real run
 
 dist.destroy_process_group()

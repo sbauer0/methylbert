@@ -5,10 +5,9 @@ import warnings
 import numpy as np
 import pandas as pd
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, auc, roc_curve
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -80,23 +79,26 @@ class MethylBertTrainer(object):
         self.min_loss = np.inf
         self.save_path = save_path
         self.is_master = (not dist.is_initialized()) or (dist.get_rank() == 0)
-        if save_path and not os.path.exists(save_path):
+        if save_path and self.is_master and not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()   # ensure the dir exists before any rank tries to use it
         self.f_train = os.path.join(self.save_path, "train.csv")
         self.f_eval = os.path.join(self.save_path, "eval.csv")
 
 
     def save(self, file_path="output/bert_trained.model"):
-        '''
-        Saving the current BERT model on file_path
-
-        file_path: str
-            model output path which gonna be file_path+"ep%d" % epoch
-        '''
-        self.bert.to("cpu")
-        self.bert.save_pretrained(file_path)
-        self.bert.to(self.device)
+        if dist.is_initialized() and dist.get_rank() != 0:
+            dist.barrier()
+            return
+        
+        # Master: save without disturbing the live DDP-wrapped model.
+        cpu_state = {k: v.detach().cpu() for k, v in self.bert.state_dict().items()}
+        # if you want save_pretrained's directory layout, write a temp module:
+        self.bert.save_pretrained(file_path, state_dict=cpu_state)
         print("Step:%d Model Saved on:" % self.step, file_path)
+        if dist.is_initialized():
+            dist.barrier()
 
     def _setup_model(self):
         '''
@@ -198,60 +200,67 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
 
     def _eval_iteration(self, data_loader):
         """
-        loop over the data_loader for evaluation. Each rank processes its
-        slice (via DistributedSampler); mean_loss is all-reduced across ranks
-        for a global average. predict_res is rank-local — only meaningful on
-        rank 0 for the in-training eval.
+        DDP-aware eval. Each rank accumulates scalar stats over its
+        DistributedSampler slice; we then all-reduce them so every rank gets
+        identical, globally-correct loss and MLM accuracy. No predictions or
+        labels are gathered — eval memory is independent of test-set size.
+
+        HuggingFace's BertForMaskedLM returns the loss already averaged over
+        the non-ignored (label >= 0) tokens in a batch. To get the exact
+        global mean we re-weight each batch loss by its non-ignored count.
         """
-        predict_res = {"prediction": [], "input": [], "label": [], "mask": []}
-        mean_loss = 0
         self.model.eval()
 
+        # Use float64 for the running loss sum to avoid precision drift on
+        # large test sets.
+        loss_sum  = torch.zeros((), device=self.device, dtype=torch.float64)
+        n_valid   = torch.zeros((), device=self.device, dtype=torch.long)
+        n_correct = torch.zeros((), device=self.device, dtype=torch.long)
+
         for i, batch in enumerate(data_loader):
-            data = {key: value.to(self.device) for key, value in batch.items()}
+            data = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
-                                    enabled=self._config.amp):
-                    mask_lm_output = self.model.forward(
-                        input_ids=data["bert_input"],
-                        token_type_ids=data["methyl_seq"].long(),
-                        labels=data["bert_label"],
-                    )
+            with torch.no_grad(), torch.autocast(
+                    device_type="cuda" if self._config.with_cuda else "cpu",
+                    enabled=self._config.amp):
+                out = self.model.forward(
+                    input_ids=data["bert_input"],
+                    token_type_ids=data["methyl_seq"].long(),
+                    labels=data["bert_label"],
+                )
 
-                mean_loss += mask_lm_output[0].mean().item() / len(data_loader)
-                predict_res["prediction"].append(np.argmax(mask_lm_output[1].cpu().detach(), axis=-1))
-                predict_res["input"].append(data["bert_input"].cpu().detach())
-                predict_res["label"].append(data["bert_label"].cpu().detach())
-                predict_res["mask"].append(data["bert_mask"].cpu().detach())
+            labels = data["bert_label"]
+            valid  = labels >= 0                # (B, L) — MLM-evaluated positions
+            n_v    = valid.sum()
+            loss_sum  += out[0].detach().double() * n_v
+            n_valid   += n_v
+
+            preds = out[1].argmax(dim=-1)
+            n_correct += ((preds == labels) & valid).sum()
 
             if self._config.eval:
                 print("Batch %d/%d is done...." % (i, len(data_loader)))
 
-            del mask_lm_output
-            del data
+            del out, data
 
-        predict_res["prediction"] = np.concatenate(predict_res["prediction"], axis=0)
-        predict_res["input"] = np.concatenate(predict_res["input"], axis=0)
-        predict_res["label"] = np.concatenate(predict_res["label"], axis=0)
-        predict_res["mask"] = np.concatenate(predict_res["mask"], axis=0)
-
-        # All-reduce mean_loss for a global average across ranks
+        # Three scalar reductions — effectively free.
         if dist.is_initialized():
-            loss_tensor = torch.tensor([mean_loss], device=self.device)
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            mean_loss = (loss_tensor / dist.get_world_size()).item()
+            for t in (loss_sum, n_valid, n_correct):
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+        denom     = n_valid.clamp(min=1)
+        mean_loss = (loss_sum / denom).item()
+        accuracy  = (n_correct.double() / denom.double()).item()
 
         self.model.train()
-        return predict_res, mean_loss
+        return {"loss": mean_loss, "accuracy": accuracy}
 
     def _iteration(self, steps, data_loader, verbose):
         """
         Train loop. DDP-aware: rank-0-only logging/CSVs/checkpoints,
         DistributedSampler.set_epoch each epoch, no_sync during gradient
-        accumulation, all-reduce on eval loss.
+        accumulation, scalar all-reduce on eval metrics.
         """
-        predict_res = {"prediction": [], "input": [], "label": []}
         self.step = 0
 
         # File initialization — rank 0 only
@@ -281,7 +290,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
         self.model.train()
         train_prediction_res = {"prediction": [], "label": []}
 
-        scaler = GradScaler() if self._config.amp else None
+        scaler = GradScaler("cuda") if self._config.amp else None
         duration = 0
 
         for epoch in range(epochs):
@@ -344,28 +353,25 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     self.scheduler.step()
                     self.model.zero_grad()
 
-                    # Eval — all ranks call _eval_iteration (for the all-reduce
-                    # to work); only rank 0 writes the CSV.
+                    # Eval — all ranks call _eval_iteration so the scalar
+                    # all-reduces complete; metrics are globally averaged.
+                    # Only rank 0 writes the CSV.
                     if (self.test_data is not None
                             and self.step % self._config.eval_freq == 0
                             and self.step > 0):
-                        test_pred, test_loss = self._eval_iteration(self.test_data)
+                        eval_metrics = self._eval_iteration(self.test_data)
                         if self.is_master:
-                            idces = np.where(test_pred["label"] >= 0)
-                            test_pred_acc = self._acc(
-                                test_pred["prediction"][idces[0], idces[1]],
-                                test_pred["label"][idces[0], idces[1]],
-                            )
                             with open(self.f_eval, "a") as f_perform:
-                                f_perform.write("\t".join(
-                                    [str(self.step), str(test_pred_acc), str(test_loss)]
-                                ) + "\n")
-                        del test_pred
+                                f_perform.write("\t".join([
+                                    str(self.step),
+                                    str(eval_metrics["accuracy"]),
+                                    str(eval_metrics["loss"]),
+                                ]) + "\n")
 
                     # Log print — rank 0
                     if self.is_master and self.step % self._config.log_freq == 0:
                         print("\nTrain Step %d iter - loss : %f / lr : %f" %
-                              (self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
+                            (self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
 
                     # Train CSV — rank 0
@@ -391,12 +397,8 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     self.step += 1
 
                     # Checkpoint — rank 0, every save_freq steps
-                    if (self.is_master
-                            and isinstance(self._config.save_freq, int)
-                            and self.step % self._config.save_freq == 0):
-                        step_save_path = os.path.join(
-                            self.save_path, f"step_{self.step}"
-                        )
+                    if isinstance(self._config.save_freq, int) and self.step % self._config.save_freq == 0:
+                        step_save_path = os.path.join(self.save_path, f"step_{self.step}")
                         self.save(step_save_path)
 
                     duration = 0
