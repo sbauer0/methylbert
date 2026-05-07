@@ -20,6 +20,8 @@ from methylbert.config import MethylBERTConfig, get_config
 from methylbert.data.vocab import MethylVocab
 from methylbert.network import MethylBertEmbeddedDMR
 from methylbert.utils import get_dna_seq
+import torch.distributed as dist
+from contextlib import nullcontext
 
 torch.set_warn_always(False) # one warning per process
 
@@ -77,8 +79,9 @@ class MethylBertTrainer(object):
         # To save the best model
         self.min_loss = np.inf
         self.save_path = save_path
+        self.is_master = (not dist.is_initialized()) or (dist.get_rank() == 0)
         if save_path and not os.path.exists(save_path):
-            os.mkdir(save_path)
+            os.makedirs(save_path, exist_ok=True)
         self.f_train = os.path.join(self.save_path, "train.csv")
         self.f_eval = os.path.join(self.save_path, "eval.csv")
 
@@ -103,8 +106,13 @@ class MethylBertTrainer(object):
         self.model = self.bert.to(self.device)
         print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
-        # Distributed GPU training if CUDA can detect more than 1 GPU
-        if self._config.with_cuda and torch.cuda.device_count() > 1:
+        # Distributed GPU training if CUDA can detect more than 1 GPU.
+        # Skip auto-DataParallel when DDP has been initialized (torchrun launched
+        # us under torch.distributed) — DataParallel and DDP can't coexist on the
+        # same model.
+        if (self._config.with_cuda
+                and torch.cuda.device_count() > 1
+                and not dist.is_initialized()):
             print("Using %d GPUs for BERT" % torch.cuda.device_count())
             self.model = nn.DataParallel(self.model)
 
@@ -173,7 +181,6 @@ class MethylBertTrainer(object):
 
         return accuracy_score(y_true=label, y_pred=pred)
 
-
 class MethylBertPretrainTrainer(MethylBertTrainer):
 
     def __init__(self, *args, **kwargs):
@@ -191,126 +198,140 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
 
     def _eval_iteration(self, data_loader):
         """
-        loop over the data_loader for evaluation
-
-        :param data_loader: torch.utils.data.DataLoader for test
-        :return: DataFrame,
+        loop over the data_loader for evaluation. Each rank processes its
+        slice (via DistributedSampler); mean_loss is all-reduced across ranks
+        for a global average. predict_res is rank-local — only meaningful on
+        rank 0 for the in-training eval.
         """
-
         predict_res = {"prediction": [], "input": [], "label": [], "mask": []}
-
         mean_loss = 0
         self.model.eval()
 
         for i, batch in enumerate(data_loader):
-
             data = {key: value.to(self.device) for key, value in batch.items()}
 
             with torch.no_grad():
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
                                     enabled=self._config.amp):
-                        mask_lm_output = self.model.forward(input_ids=data["bert_input"],
-                                                            token_type_ids=data["methyl_seq"].long(),
-                                                            labels=data["bert_label"])
+                    mask_lm_output = self.model.forward(
+                        input_ids=data["bert_input"],
+                        token_type_ids=data["methyl_seq"].long(),
+                        labels=data["bert_label"],
+                    )
 
-                mean_loss += mask_lm_output[0].mean().item()/len(data_loader)
+                mean_loss += mask_lm_output[0].mean().item() / len(data_loader)
                 predict_res["prediction"].append(np.argmax(mask_lm_output[1].cpu().detach(), axis=-1))
                 predict_res["input"].append(data["bert_input"].cpu().detach())
                 predict_res["label"].append(data["bert_label"].cpu().detach())
                 predict_res["mask"].append(data["bert_mask"].cpu().detach())
 
             if self._config.eval:
-                print("Batch %d/%d is done...."%(i, len(data_loader)))
+                print("Batch %d/%d is done...." % (i, len(data_loader)))
 
             del mask_lm_output
             del data
 
-        # Integrate all results
         predict_res["prediction"] = np.concatenate(predict_res["prediction"], axis=0)
         predict_res["input"] = np.concatenate(predict_res["input"], axis=0)
-        predict_res["label"] = np.concatenate(predict_res["label"],  axis=0)
-        predict_res["mask"] = np.concatenate(predict_res["mask"],  axis=0)
+        predict_res["label"] = np.concatenate(predict_res["label"], axis=0)
+        predict_res["mask"] = np.concatenate(predict_res["mask"], axis=0)
+
+        # All-reduce mean_loss for a global average across ranks
+        if dist.is_initialized():
+            loss_tensor = torch.tensor([mean_loss], device=self.device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            mean_loss = (loss_tensor / dist.get_world_size()).item()
 
         self.model.train()
-        return predict_res, np.mean(mean_loss)
-
+        return predict_res, mean_loss
 
     def _iteration(self, steps, data_loader, verbose):
         """
-        loop over the data_loader for training or testing
-        if on train status, backward operation is activated
-        and also auto save the model every epoch
-
-        :param steps: total steps to train
-        :param data_loader: torch.utils.data.DataLoader for training
-        :param warm_up: number of steps for warming up the learning rate
-        :return: None
+        Train loop. DDP-aware: rank-0-only logging/CSVs/checkpoints,
+        DistributedSampler.set_epoch each epoch, no_sync during gradient
+        accumulation, all-reduce on eval loss.
         """
         predict_res = {"prediction": [], "input": [], "label": []}
         self.step = 0
 
-        if os.path.exists(self.f_train):
-            os.remove(self.f_train)
+        # File initialization — rank 0 only
+        if self.is_master:
+            if os.path.exists(self.f_train):
+                os.remove(self.f_train)
+            with open(self.f_train, "a") as f_perform:
+                f_perform.write("step\tloss\tacc\tlr\n")
 
-        with open(self.f_train, "a") as f_perform:
-            f_perform.write("step\tloss\tacc\tlr\n")
+            if os.path.exists(self.f_eval):
+                os.remove(self.f_eval)
+            with open(self.f_eval, "a") as f_perform:
+                f_perform.write("step\ttest_acc\ttest_loss\n")
 
-        if os.path.exists(self.f_eval):
-            os.remove(self.f_eval)
+        # LR scheduler
+        self.scheduler = learning_rate_scheduler(
+            self.optim,
+            num_warmup_steps=self._config.warmup_step,
+            num_training_steps=steps,
+            decrease_steps=self._config.decrease_steps,
+        )
 
-        with open(self.f_eval, "a") as f_perform:
-            f_perform.write("step\ttest_acc\ttest_loss\n")
-
-
-        # Set up a learning rate scheduler
-        self.scheduler = learning_rate_scheduler(self.optim,
-                                                 num_warmup_steps=self._config.warmup_step,
-                                                 num_training_steps=steps,
-                                                 decrease_steps=self._config.decrease_steps)
-
-        # Set up configuration for train iteration
         global_step_loss = 0
         local_step = 0
-
         epochs = steps // (len(data_loader) // self._config.gradient_accumulation_steps) + 1
         self.model.zero_grad()
         self.model.train()
-        train_prediction_res = {"prediction":[], "label":[]}
+        train_prediction_res = {"prediction": [], "label": []}
 
         scaler = GradScaler() if self._config.amp else None
-
         duration = 0
-        for epoch in range(epochs):
-            for i, batch in enumerate(data_loader):
-                # 0. batch_data will be sent into the device(GPU or cpu)
-                data = {key: value.to(self.device) for key, value in batch.items()}
 
+        for epoch in range(epochs):
+            # Reseed the DistributedSampler each epoch for fresh shuffles
+            if hasattr(data_loader.sampler, "set_epoch"):
+                data_loader.sampler.set_epoch(epoch)
+
+            for i, batch in enumerate(data_loader):
+                data = {key: value.to(self.device) for key, value in batch.items()}
                 start = time.time()
 
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
                                     enabled=self._config.amp):
-                    mask_lm_output = self.model.forward(input_ids=data["bert_input"],
-                                                        token_type_ids=data["methyl_seq"].long(),
-                                                        labels=data["bert_label"])
+                    mask_lm_output = self.model.forward(
+                        input_ids=data["bert_input"],
+                        token_type_ids=data["methyl_seq"].long(),
+                        labels=data["bert_label"],
+                    )
 
                 loss = mask_lm_output[0]
 
-                # Concatenate predicted sequences for the evaluation
-                train_prediction_res["prediction"].append(np.argmax(mask_lm_output[1].cpu().detach(), axis=-1))
-                train_prediction_res["label"].append(data["bert_label"].cpu().detach())
+                # Track predictions only on rank 0 (others save the cycles).
+                if self.is_master:
+                    train_prediction_res["prediction"].append(
+                        np.argmax(mask_lm_output[1].cpu().detach(), axis=-1)
+                    )
+                    train_prediction_res["label"].append(data["bert_label"].cpu().detach())
 
-                # Calculate loss and back-propagation
                 if "cuda" in self.device.type:
                     loss = loss.mean()
-                loss = loss/self._config.gradient_accumulation_steps
-                scaler.scale(loss).backward() if self._config.amp else loss.backward()
+                loss = loss / self._config.gradient_accumulation_steps
+
+                # no_sync on non-final microbatches: skip the DDP all-reduce
+                # on intermediate accumulation steps, do it only at the boundary.
+                is_last_microbatch = (
+                    (local_step + 1) % self._config.gradient_accumulation_steps == 0
+                )
+                sync_ctx = (
+                    self.model.no_sync()
+                    if hasattr(self.model, "no_sync") and not is_last_microbatch
+                    else nullcontext()
+                )
+                with sync_ctx:
+                    scaler.scale(loss).backward() if self._config.amp else loss.backward()
 
                 global_step_loss += loss.item()
                 duration += time.time() - start
 
-                # Gradient accumulation
-                if (local_step+1) % self._config.gradient_accumulation_steps == 0:
-
+                # Optimizer step on the last microbatch of each accumulation cycle
+                if is_last_microbatch:
                     if self._config.amp:
                         scaler.unscale_(self.optim)
                         nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
@@ -323,54 +344,72 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     self.scheduler.step()
                     self.model.zero_grad()
 
-                    # Evaluation with both train and testdata
-                    if self.test_data is not None and self.step % self._config.eval_freq == 0 and self.step > 0:
-
+                    # Eval — all ranks call _eval_iteration (for the all-reduce
+                    # to work); only rank 0 writes the CSV.
+                    if (self.test_data is not None
+                            and self.step % self._config.eval_freq == 0
+                            and self.step > 0):
                         test_pred, test_loss = self._eval_iteration(self.test_data)
-                        idces = np.where(test_pred["label"]>=0)
-                        test_pred_acc = self._acc(test_pred["prediction"][idces[0], idces[1]],
-                                                  test_pred["label"][idces[0], idces[1]])
-
-                        with open(self.f_eval, "a") as f_perform:
-                            f_perform.write("\t".join([str(self.step), str(test_pred_acc), str(test_loss)]) +"\n")
-
+                        if self.is_master:
+                            idces = np.where(test_pred["label"] >= 0)
+                            test_pred_acc = self._acc(
+                                test_pred["prediction"][idces[0], idces[1]],
+                                test_pred["label"][idces[0], idces[1]],
+                            )
+                            with open(self.f_eval, "a") as f_perform:
+                                f_perform.write("\t".join(
+                                    [str(self.step), str(test_pred_acc), str(test_loss)]
+                                ) + "\n")
                         del test_pred
 
-                    if self.step % self._config.log_freq == 0:
-                        print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
+                    # Log print — rank 0
+                    if self.is_master and self.step % self._config.log_freq == 0:
+                        print("\nTrain Step %d iter - loss : %f / lr : %f" %
+                              (self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
 
-                    #if self.min_loss > global_step_loss:
-                    #    print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
-                    #    self.save(self.save_path)
-                    #    self.min_loss = global_step_loss
+                    # Train CSV — rank 0
+                    if self.is_master:
+                        with open(self.f_train, "a") as f_perform:
+                            train_prediction_res["prediction"] = np.concatenate(
+                                train_prediction_res["prediction"], axis=0)
+                            train_prediction_res["label"] = np.concatenate(
+                                train_prediction_res["label"], axis=0)
 
-                    # Save the step info (step, loss, lr, acc)
-                    with open(self.f_train, "a") as f_perform:
+                            idces = np.where(train_prediction_res["label"] >= 0)
+                            train_pred_acc = self._acc(
+                                train_prediction_res["prediction"][idces[0], idces[1]],
+                                train_prediction_res["label"][idces[0], idces[1]],
+                            )
 
-                        train_prediction_res["prediction"] = np.concatenate(train_prediction_res["prediction"], axis=0)
-                        train_prediction_res["label"] = np.concatenate(train_prediction_res["label"],  axis=0)
-
-                        idces = np.where(train_prediction_res["label"]>=0)
-                        train_pred_acc = self._acc(train_prediction_res["prediction"][idces[0], idces[1]],
-                            train_prediction_res["label"][idces[0], idces[1]])
-
-                        f_perform.write("\t".join([str(self.step), str(global_step_loss), str(train_pred_acc), str(self.optim.param_groups[0]["lr"])])+"\n")
+                            f_perform.write("\t".join([
+                                str(self.step), str(global_step_loss),
+                                str(train_pred_acc),
+                                str(self.optim.param_groups[0]["lr"]),
+                            ]) + "\n")
 
                     self.step += 1
 
-                    duration=0
+                    # Checkpoint — rank 0, every save_freq steps
+                    if (self.is_master
+                            and isinstance(self._config.save_freq, int)
+                            and self.step % self._config.save_freq == 0):
+                        step_save_path = os.path.join(
+                            self.save_path, f"step_{self.step}"
+                        )
+                        self.save(step_save_path)
+
+                    duration = 0
                     global_step_loss = 0
                     del train_prediction_res
-                    train_prediction_res = {"prediction":[], "label":[]}
+                    train_prediction_res = {"prediction": [], "label": []}
 
                 if steps == self.step:
                     break
-                local_step+=1
+                local_step += 1
 
             if steps == self.step:
                 break
-
 
 class MethylBertFinetuneTrainer(MethylBertTrainer):
     def __init__(self, *args, **kwargs):
