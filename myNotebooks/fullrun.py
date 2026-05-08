@@ -97,6 +97,6 @@ trainer.model = trainer.model.to(f"cuda:{local_rank}")
 if world_size > 1:
     trainer.model = DDP(trainer.model, device_ids=[local_rank])
 
-trainer.train(steps=5000)   # smoke test; bump to ~200000 for real run
+trainer.train(steps=5001)   # smoke test; bump to ~200000 for real run
 
 dist.destroy_process_group()
