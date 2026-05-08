@@ -7,7 +7,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, auc, roc_curve
-from torch.amp import GradScaler
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -192,10 +191,12 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
     def create_model(self, *args, **kwargs):
         # Handle Subset wrapping from random_split
         dataset = self.train_data.dataset
-        while hasattr(dataset, 'dataset'):  # unwrap Subset/ConcatDataset/etc
+        while hasattr(dataset, 'dataset'):
             dataset = dataset.dataset
         config = BertConfig(vocab_size=len(dataset.vocab), *args, **kwargs)
-        self.bert = BertForMaskedLM(config)
+        config._attn_implementation = "sdpa"      # <-- set on config
+        self.bert = BertForMaskedLM(config)        # <-- no kwarg
+        print(f"Attention impl: {self.bert.config._attn_implementation}", flush=True)
         self._setup_model()
 
     def _eval_iteration(self, data_loader):
@@ -222,6 +223,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
 
             with torch.no_grad(), torch.autocast(
                     device_type="cuda" if self._config.with_cuda else "cpu",
+                    dtype=torch.bfloat16,
                     enabled=self._config.amp):
                 out = self.model.forward(
                     input_ids=data["bert_input"],
@@ -286,11 +288,10 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
         global_step_loss = 0
         local_step = 0
         epochs = steps // (len(data_loader) // self._config.gradient_accumulation_steps) + 1
-        self.model.zero_grad()
+        self.model.zero_grad(set_to_none=True)
         self.model.train()
         train_prediction_res = {"prediction": [], "label": []}
 
-        scaler = GradScaler("cuda") if self._config.amp else None
         duration = 0
 
         for epoch in range(epochs):
@@ -299,10 +300,11 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                 data_loader.sampler.set_epoch(epoch)
 
             for i, batch in enumerate(data_loader):
-                data = {key: value.to(self.device) for key, value in batch.items()}
+                data = {key: value.to(self.device, non_blocking=True) for key, value in batch.items()}
                 start = time.time()
 
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
+                                    dtype=torch.bfloat16,
                                     enabled=self._config.amp):
                     mask_lm_output = self.model.forward(
                         input_ids=data["bert_input"],
@@ -313,11 +315,13 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                 loss = mask_lm_output[0]
 
                 # Track predictions only on rank 0 (others save the cycles).
+                # argmax returns int64, which NumPy can convert; doing the argmax on-GPU
+                # also avoids moving the (B, L, vocab) bf16 logits tensor through CPU.
                 if self.is_master:
                     train_prediction_res["prediction"].append(
-                        np.argmax(mask_lm_output[1].cpu().detach(), axis=-1)
+                        mask_lm_output[1].argmax(dim=-1).cpu().numpy()
                     )
-                    train_prediction_res["label"].append(data["bert_label"].cpu().detach())
+                    train_prediction_res["label"].append(data["bert_label"].cpu().numpy())
 
                 if "cuda" in self.device.type:
                     loss = loss.mean()
@@ -334,24 +338,16 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     else nullcontext()
                 )
                 with sync_ctx:
-                    scaler.scale(loss).backward() if self._config.amp else loss.backward()
+                    loss.backward()
 
                 global_step_loss += loss.item()
                 duration += time.time() - start
 
-                # Optimizer step on the last microbatch of each accumulation cycle
                 if is_last_microbatch:
-                    if self._config.amp:
-                        scaler.unscale_(self.optim)
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
-                        scaler.step(self.optim)
-                        scaler.update()
-                    else:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
-                        self.optim.step()
-
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
+                    self.optim.step()
                     self.scheduler.step()
-                    self.model.zero_grad()
+                    self.model.zero_grad(set_to_none=True)
 
                     # Eval — all ranks call _eval_iteration so the scalar
                     # all-reduces complete; metrics are globally averaged.
@@ -459,9 +455,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         with torch.no_grad():
             for i, batch in enumerate(data_loader):
                 # 0. batch_data will be sent into the device(GPU or cpu)
-                data = {key: value.to(self.device) for key, value in batch.items() if type(value) != list}
+                data = {key: value.to(self.device, non_blocking=True) for key, value in batch.items() if type(value) != list}
 
-                with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu", enabled=self._config.amp):
+                with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
+                                    dtype=torch.bfloat16,
+                                    enabled=self._config.amp):
                     mask_lm_output = self.model.forward(step=self.step,
                                             input_ids = data["dna_seq"],
                                             token_type_ids=data["methyl_seq"],
@@ -534,13 +532,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
         epochs = steps // (len(data_loader) // self._config.gradient_accumulation_steps) + 1
 
-        self.model.zero_grad()
+        self.model.zero_grad(set_to_none=True)
         if verbose > 0:
             print(self.model.training)
         self.model.train()
         train_prediction_res = {"dmr_label":[], "pred_ctype_label":[], "ctype_label":[]}
-
-        scaler = GradScaler() if self._config.amp else None
 
         duration = 0
         epoch_progress_bar = tqdm(total=epochs, desc="Training...")
@@ -549,10 +545,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                                       desc=f"Epoch {epoch+1}/{epochs}")
             for i, batch in enumerate(data_loader):
                 # 0. batch_data will be sent into the device(GPU or cpu)
-                data = {key: value.to(self.device) for key, value in batch.items() if type(value) != list}
+                data = {key: value.to(self.device, non_blocking=True) for key, value in batch.items() if type(value) != list}
 
                 start = time.time()
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
+                                    dtype=torch.bfloat16,
                                     enabled=self._config.amp):
                     mask_lm_output = self.model.forward(step=self.step,
                                             input_ids=data["dna_seq"],
@@ -566,33 +563,28 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
 
                 # Cell-type classification
-                train_prediction_res["pred_ctype_label"].append(np.argmax(mask_lm_output["classification_logits"].cpu().detach(), axis=-1))
+                train_prediction_res["pred_ctype_label"].append(
+                    mask_lm_output["classification_logits"].argmax(dim=-1).cpu().numpy()
+                )
                 train_prediction_res["ctype_label"].append(data["ctype_label"].detach().cpu())
 
 
                 # Calculate loss and back-propagation
                 loss = mask_lm_output["loss"].mean() if "cuda" in self.device.type else mask_lm_output["loss"]
-                loss = loss/self._config.gradient_accumulation_steps
-                scaler.scale(loss).backward(retain_graph=True) if self._config.amp else loss.backward(retain_graph=True)
+                loss = loss / self._config.gradient_accumulation_steps
+                loss.backward(retain_graph=True)
 
                 loss_val = loss.item()
                 global_step_loss += loss_val
 
                 duration += time.time() - start
                 # Gradient accumulation
-                if (local_step+1) % self._config.gradient_accumulation_steps == 0:
+                if (local_step + 1) % self._config.gradient_accumulation_steps == 0:
                     gradient_accum_start = time.time()
-                    if self._config.amp:
-                        scaler.unscale_(self.optim)
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
-                        scaler.step(self.optim)
-                        scaler.update()
-                    else:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
-                        self.optim.step()
-
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
+                    self.optim.step()
                     self.scheduler.step()
-                    self.model.zero_grad()
+                    self.model.zero_grad(set_to_none=True)
 
                 if (local_step+1) % self._config.eval_freq == 0 or local_step == 0:
                     # Evaluation
@@ -750,7 +742,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
             for k, v in batch.items():
                 if type(v) != list:
-                    data[k] = v.to(self.device)
+                    data[k] = v.to(self.device, non_blocking=True)
                 if k not in res.keys():
                     res[k] = v.numpy() if type(v) == torch.Tensor else v
                 else:
@@ -765,10 +757,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                                             labels = data["dmr_label"],
                                             ctype_label=data["ctype_label"])
 
-                if "pred" in res.keys():
-                    res["pred"] = np.concatenate([res["pred"], np.argmax(mask_lm_output["classification_logits"].cpu().detach(), axis=-1)], axis=0)
+                preds = mask_lm_output["classification_logits"].argmax(dim=-1).cpu().numpy()
+                if "pred" in res:
+                    res["pred"] = np.concatenate([res["pred"], preds], axis=0)
                 else:
-                    res["pred"] = np.argmax(mask_lm_output["classification_logits"].cpu().detach(), axis=-1)
+                    res["pred"] = preds
 
                 if logit:
                     logits.append(mask_lm_output["classification_logits"].cpu().detach().numpy())

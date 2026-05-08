@@ -7,6 +7,8 @@ from methylbert.data.dataset import MethylBertPretrainDatasetBinary
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from methylbert import trainer as tr
+from torch.utils.data import Subset
+import numpy as np
 
 # DDP setup. torchrun sets LOCAL_RANK, RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT.
 
@@ -41,12 +43,12 @@ if not is_master:
 vocab = MethylVocab(k=3)
 
 train_dataset = MethylBertPretrainDatasetBinary(
-    data_dir="/tmp/pretrain_shards_4state_v1_balanced/train",
+    data_dir="/localstorage/bauerste/pretrain_data/pretrain_shards_4state_v1_balanced/train",
     vocab=vocab,
     seq_len=510,
 )
 test_dataset = MethylBertPretrainDatasetBinary(
-    data_dir="/tmp/pretrain_shards_4state_v1_balanced/test",
+    data_dir="/localstorage/bauerste/pretrain_data/pretrain_shards_4state_v1_balanced/test",
     vocab=vocab,
     seq_len=510,
 )
@@ -54,17 +56,21 @@ test_dataset = MethylBertPretrainDatasetBinary(
 print(f"Train dataset size: {len(train_dataset):,}")
 print(f"Test dataset size:  {len(test_dataset):,}")
 
+eval_rng = np.random.default_rng(42)
+eval_indices = eval_rng.choice(len(test_dataset), size=25_600, replace=False)
+eval_subset = Subset(test_dataset, eval_indices.tolist())
+
 train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=42)
-test_sampler  = DistributedSampler(test_dataset,  shuffle=False)
+test_sampler = DistributedSampler(eval_subset, shuffle=False)
 
 train_loader = DataLoader(
     train_dataset, batch_size=128, sampler=train_sampler,
-    num_workers=4, pin_memory=True,
+    num_workers=8, pin_memory=True,
     persistent_workers=True, drop_last=True,
 )
 test_loader = DataLoader(
-    test_dataset, batch_size=128, sampler=test_sampler,
-    num_workers=4, pin_memory=True,
+    eval_subset, batch_size=128, sampler=test_sampler,
+    num_workers=8, pin_memory=True,
     persistent_workers=True, drop_last=False,
 )
 
@@ -75,10 +81,10 @@ trainer = tr.MethylBertPretrainTrainer(
     test_dataloader=test_loader,
     lr=4e-4,
     warmup_step=10000,
-    decrease_steps=180000,        # extended from 100k to fit a ~200k step budget
-    eval_freq=200,
-    log_freq=50,
-    save_freq=50,               # lowered from 10k for safer checkpointing
+    decrease_steps=100000,       
+    eval_freq=1000,
+    log_freq=100,
+    save_freq=20000,         
     amp=True,
     gradient_accumulation_steps=4,
 )
@@ -91,6 +97,6 @@ trainer.model = trainer.model.to(f"cuda:{local_rank}")
 if world_size > 1:
     trainer.model = DDP(trainer.model, device_ids=[local_rank])
 
-trainer.train(steps=51)   # smoke test; bump to ~200000 for real run
+trainer.train(steps=5000)   # smoke test; bump to ~200000 for real run
 
 dist.destroy_process_group()
