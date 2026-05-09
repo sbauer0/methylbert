@@ -141,9 +141,9 @@ class MethylBertPretrainDataset(MethylBertDataset):
 
 		return mask_list
 
-	def _masking(self, inputs: torch.Tensor, threshold=0.15):
-		"""
-			Moidfied version of masking token function
+	"""def _masking(self, inputs: torch.Tensor, threshold=0.15):
+		
+			Modified version of masking token function
 			Originally developed by Huggingface (datacollator) and DNABERT
 
 			https://github.com/huggingface/transformers/blob/9a24b97b7f304fa1ceaaeba031241293921b69d3/src/transformers/data/data_collator.py#L747
@@ -153,7 +153,7 @@ class MethylBertPretrainDataset(MethylBertDataset):
 			Added additional tasks to handle each sequence
 			Lines using tokenizer were modified due to different tokenizer object structure
 
-		"""
+		
 
 		labels = inputs.clone()
 
@@ -197,23 +197,114 @@ class MethylBertPretrainDataset(MethylBertDataset):
 
 		# 10% of the time, we replace masked input tokens with random word
 		indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-		random_words = torch.randint(len(self.vocab), labels.shape, dtype=torch.int16)
+		random_words = torch.randint(
+            low=self.vocab.mask_index + 1,
+            high=len(self.vocab),
+            size=labels.shape,
+            dtype=torch.int16,
+        )
 		inputs[indices_random] = random_words[indices_random]
 
 		# The rest of the time (10% of the time) we keep the masked input tokens unchanged
 
-		# Special tokens (SOS, EOS)
-		if end < inputs.shape[0]:
-			inputs[end] = self.vocab.eos_index
-		else:
-			inputs[-1] = self.vocab.eos_index
+		inputs         = torch.cat((inputs,         torch.tensor([self.vocab.pad_index])))
+		labels         = torch.cat((labels,         torch.tensor([-100])))
+		masked_indices = torch.cat((masked_indices, torch.tensor([False])))
 
-		labels = torch.cat((torch.tensor([-100]), labels))
-		inputs = torch.cat((torch.tensor([self.vocab.sos_index]), inputs))
-		masked_index = torch.cat((torch.tensor([False]), masked_index))
+		# Place EOS in the new slot at index end + 1.
+		inputs[end + 1] = self.vocab.eos_index
 
+		# Prepend SOS to all three tensors. Final length: seq_len + 2 = 512.
+		labels         = torch.cat((torch.tensor([-100]),                  labels))
+		inputs         = torch.cat((torch.tensor([self.vocab.sos_index]),  inputs))
+		masked_indices = torch.cat((torch.tensor([False]),                 masked_indices))
 
-		return inputs, labels, masked_index
+		return inputs, labels, masked_indices"""
+	
+	def _masking(self, inputs: torch.Tensor, threshold=0.15):
+		"""
+		Spaced-center masking.
+
+		- Centers selected sequentially with Bernoulli(threshold), enforcing
+		a minimum spacing of len(self.mask_list) + 1 = k positions between
+		centers so no two blocks overlap.
+		- Each center's k-mer block (center + neighbors from self.mask_list)
+		is corrupted: neighbors always become [MASK]; the center follows
+		80/10/10 mask/random/keep.
+		- Loss is computed only at centers (not at neighbors).
+		- For random replacement, the center's flanking bases are preserved
+		and only the middle base is changed (k=3 only — see note).
+		"""
+		labels = inputs.clone()
+
+		# Sequential center selection with spacing.
+		# Skip specials (token id < 5).
+		seq_len = inputs.shape[0]
+		spacing = len(self.mask_list) + 1   # for k=3 this is 3
+		centers = []
+		p = 0
+		while p < seq_len:
+			if inputs[p].item() < 5:
+				p += 1
+				continue
+			if torch.rand(1).item() < threshold:
+				centers.append(p)
+				p += spacing
+			else:
+				p += 1
+
+		end = torch.where(inputs >= 5)[0]
+		end = end[-1].item() if len(end) > 0 else seq_len - 1
+
+		# Build the expanded set (centers + neighbors), bounded to [0, end].
+		# Neighbors are always present in the corrupted input but not in labels.
+		block_offsets = [0] + self.mask_list
+		expanded_positions = set()
+		for c in centers:
+			for d in block_offsets:
+				q = c + d
+				if 0 <= q <= end:
+					expanded_positions.add(q)
+
+		# Loss only at centers: zero out labels everywhere else.
+		label_mask = torch.zeros(seq_len, dtype=torch.bool)
+		label_mask[centers] = True
+		labels[~label_mask] = -100
+
+		# Apply corruption.
+		# Neighbors: always [MASK].
+		for q in expanded_positions:
+			if q not in centers:   # neighbor
+				inputs[q] = self.vocab.mask_index
+
+		# Centers: 80/10/10.
+		for c in centers:
+			r = torch.rand(1).item()
+			if r < 0.8:
+				inputs[c] = self.vocab.mask_index
+			elif r < 0.9:
+				inputs[c] = self._constrained_random_replacement(inputs[c].item())
+			# else: keep original
+
+		# masked_indices for downstream methylation-hiding: union of centers
+		# and neighbors (everything in the corrupted-input region).
+		masked_indices = torch.zeros(seq_len, dtype=torch.bool)
+		masked_indices[list(expanded_positions)] = True
+
+		# --- length 512 layout, unchanged from previous fix ---
+		inputs         = torch.cat((inputs,         torch.tensor([self.vocab.pad_index])))
+		labels         = torch.cat((labels,         torch.tensor([-100])))
+		masked_indices = torch.cat((masked_indices, torch.tensor([False])))
+
+		inputs[end + 1] = self.vocab.eos_index
+
+		labels         = torch.cat((torch.tensor([-100]),                 labels))
+		inputs         = torch.cat((torch.tensor([self.vocab.sos_index]), inputs))
+		masked_indices = torch.cat((torch.tensor([False]),                masked_indices))
+
+		return inputs, labels, masked_indices
+	
+	
 
 class MethylBertFinetuneDataset(MethylBertDataset):
 	def __init__(self, f_path: str, vocab: MethylVocab, seq_len: int, n_cores: int=10, n_seqs = None):
@@ -475,27 +566,21 @@ class MethylBertPretrainDatasetBinary(MethylBertDataset):
         # (one extra for the prepended SOS).
         masked_dna_seq, dna_label, masked_index = self._masking(dna_seq)
 
-        # Build the methylation track parallel to masked_dna_seq.
-        # Prepend STATE_NON_CPG for the SOS slot (matching SOS position 0).
+        # Build the methylation track parallel to masked_dna_seq (length seq_len + 2).
+        # Prepend STATE_NON_CPG for the SOS slot AND append one for the EOS slot.
         methyl_seq = torch.cat((
             torch.tensor([STATE_NON_CPG], dtype=torch.int8),
             methyl_seq,
+            torch.tensor([STATE_NON_CPG], dtype=torch.int8),
         ))
 
-        # Option B: at every position selected for the MLM objective, hide the
-        # methylation by setting it to STATE_UNKNOWN. This applies to all three
-        # MLM-substitution branches (80% [MASK], 10% random, 10% kept-original)
-        # because in all three the model is asked to predict at this position;
-        # leaving a 0/1 methylation visible would let the model use the
-        # CpG-context fact to narrow the masked-token prediction from 64 to 4
-        # (the XCG 3-mers).
+        # Hide methylation at every MLM-selected position.
         methyl_seq[masked_index] = STATE_UNKNOWN
 
-        # Special-token positions: STATE_NON_CPG.
-        # SOS is at index 0 (already STATE_NON_CPG from the prepend, but explicit).
-        # EOS is at end_pos + 1 in the post-SOS-prepend array (one shifted right).
+        # Reaffirm SOS and EOS positions as STATE_NON_CPG (defensive — should already
+        # hold from the cat, but masked_index could in principle touch them).
         methyl_seq[0] = STATE_NON_CPG
-        eos_in_padded = end_pos + 1
+        eos_in_padded = end_pos + 2   # +1 for the EOS placement, +1 more for SOS prepend
         if 0 <= eos_in_padded < methyl_seq.shape[0]:
             methyl_seq[eos_in_padded] = STATE_NON_CPG
 
@@ -509,3 +594,27 @@ class MethylBertPretrainDatasetBinary(MethylBertDataset):
     # Reuse the masking logic unchanged from MethylBertPretrainDataset.
     _get_mask = MethylBertPretrainDataset._get_mask
     _masking = MethylBertPretrainDataset._masking
+
+    def _constrained_random_replacement(self, original_token_id: int) -> int:
+        """
+        Given a 3-mer token id, return a token id whose 3-mer string differs
+        from the original only at the middle base. Samples uniformly from the
+        3 possible substitutions (excluding the original).
+
+        Only valid for k=3. For other k, fall back to arbitrary replacement
+        or generalize this function.
+        """
+        if self.vocab.kmers != 3:
+            # Fallback: arbitrary non-special replacement.
+            return torch.randint(
+                low=self.vocab.mask_index + 1,
+                high=len(self.vocab),
+                size=(1,),
+            ).item()
+
+        original_kmer = self.vocab.itos[original_token_id]
+        bases = ["A", "C", "G", "T"]
+        candidates = [b for b in bases if b != original_kmer[1]]
+        new_middle = candidates[torch.randint(0, 3, (1,)).item()]
+        new_kmer = original_kmer[0] + new_middle + original_kmer[2]
+        return self.vocab.stoi[new_kmer]

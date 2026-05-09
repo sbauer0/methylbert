@@ -79,15 +79,18 @@ trainer = tr.MethylBertPretrainTrainer(
     save_path="/home/bauerste/Methylbert_methylation_encoding/pretrained_model_2gpu",
     train_dataloader=train_loader,
     test_dataloader=test_loader,
-    lr=4e-4,
+    lr=1e-4,
     warmup_step=10000,
     decrease_steps=100000,       
     eval_freq=1000,
     log_freq=100,
-    save_freq=20000,         
+    save_freq=10000,         
     amp=True,
     gradient_accumulation_steps=4,
 )
+if is_master:
+    print(f"max_grad_norm = {trainer._config.max_grad_norm}", flush=True)
+
 trainer.device = torch.device(f"cuda:{local_rank}")
 
 trainer.create_model(type_vocab_size=4, num_hidden_layers=12)
