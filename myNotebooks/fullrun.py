@@ -76,7 +76,7 @@ test_loader = DataLoader(
 
 trainer = tr.MethylBertPretrainTrainer(
     vocab_size=len(vocab),
-    save_path="/tmp/bauerste/Methylbert_methylation_encoding/pretrained_model_2gpu",
+    save_path="/home/bauerste/Methylbert_methylation_encoding/pretrained_model_2gpu",
     train_dataloader=train_loader,
     test_dataloader=test_loader,
     lr=4e-4,
@@ -90,13 +90,13 @@ trainer = tr.MethylBertPretrainTrainer(
 )
 trainer.device = torch.device(f"cuda:{local_rank}")
 
-trainer.create_model(type_vocab_size=4, num_hidden_layers=6)
+trainer.create_model(type_vocab_size=4, num_hidden_layers=12)
 
 trainer.model = trainer.model.to(f"cuda:{local_rank}")
 
 if world_size > 1:
     trainer.model = DDP(trainer.model, device_ids=[local_rank])
 
-trainer.train(steps=5000)   # smoke test; bump to ~200000 for real run
+trainer.train(steps=120001)
 
 dist.destroy_process_group()
