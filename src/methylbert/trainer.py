@@ -5,10 +5,8 @@ import warnings
 import numpy as np
 import pandas as pd
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, auc, roc_curve
-from torch.cuda.amp import GradScaler
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -20,6 +18,8 @@ from methylbert.config import MethylBERTConfig, get_config
 from methylbert.data.vocab import MethylVocab
 from methylbert.network import MethylBertEmbeddedDMR
 from methylbert.utils import get_dna_seq
+import torch.distributed as dist
+from contextlib import nullcontext
 
 torch.set_warn_always(False) # one warning per process
 
@@ -77,23 +77,27 @@ class MethylBertTrainer(object):
         # To save the best model
         self.min_loss = np.inf
         self.save_path = save_path
-        if save_path and not os.path.exists(save_path):
-            os.mkdir(save_path)
+        self.is_master = (not dist.is_initialized()) or (dist.get_rank() == 0)
+        if save_path and self.is_master and not os.path.exists(save_path):
+            os.makedirs(save_path, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()   # ensure the dir exists before any rank tries to use it
         self.f_train = os.path.join(self.save_path, "train.csv")
         self.f_eval = os.path.join(self.save_path, "eval.csv")
 
 
     def save(self, file_path="output/bert_trained.model"):
-        '''
-        Saving the current BERT model on file_path
-
-        file_path: str
-            model output path which gonna be file_path+"ep%d" % epoch
-        '''
-        self.bert.to("cpu")
-        self.bert.save_pretrained(file_path)
-        self.bert.to(self.device)
+        if dist.is_initialized() and dist.get_rank() != 0:
+            dist.barrier()
+            return
+        
+        # Master: save without disturbing the live DDP-wrapped model.
+        cpu_state = {k: v.detach().cpu() for k, v in self.bert.state_dict().items()}
+        # if you want save_pretrained's directory layout, write a temp module:
+        self.bert.save_pretrained(file_path, state_dict=cpu_state)
         print("Step:%d Model Saved on:" % self.step, file_path)
+        if dist.is_initialized():
+            dist.barrier()
 
     def _setup_model(self):
         '''
@@ -103,8 +107,13 @@ class MethylBertTrainer(object):
         self.model = self.bert.to(self.device)
         print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
-        # Distributed GPU training if CUDA can detect more than 1 GPU
-        if self._config.with_cuda and torch.cuda.device_count() > 1:
+        # Distributed GPU training if CUDA can detect more than 1 GPU.
+        # Skip auto-DataParallel when DDP has been initialized (torchrun launched
+        # us under torch.distributed) — DataParallel and DDP can't coexist on the
+        # same model.
+        if (self._config.with_cuda
+                and torch.cuda.device_count() > 1
+                and not dist.is_initialized()):
             print("Using %d GPUs for BERT" % torch.cuda.device_count())
             self.model = nn.DataParallel(self.model)
 
@@ -173,7 +182,6 @@ class MethylBertTrainer(object):
 
         return accuracy_score(y_true=label, y_pred=pred)
 
-
 class MethylBertPretrainTrainer(MethylBertTrainer):
 
     def __init__(self, *args, **kwargs):
@@ -181,190 +189,225 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
         pass
 
     def create_model(self, *args, **kwargs):
-        config = BertConfig(vocab_size = len(self.train_data.dataset.vocab), *args, **kwargs)
-        self.bert = BertForMaskedLM(config)
+        # Handle Subset wrapping from random_split
+        dataset = self.train_data.dataset
+        while hasattr(dataset, 'dataset'):
+            dataset = dataset.dataset
+        config = BertConfig(vocab_size=len(dataset.vocab), *args, **kwargs)
+        config._attn_implementation = "sdpa"      # <-- set on config
+        self.bert = BertForMaskedLM(config)        # <-- no kwarg
+        print(f"Attention impl: {self.bert.config._attn_implementation}", flush=True)
         self._setup_model()
 
     def _eval_iteration(self, data_loader):
         """
-        loop over the data_loader for evaluation
+        DDP-aware eval. Each rank accumulates scalar stats over its
+        DistributedSampler slice; we then all-reduce them so every rank gets
+        identical, globally-correct loss and MLM accuracy. No predictions or
+        labels are gathered — eval memory is independent of test-set size.
 
-        :param data_loader: torch.utils.data.DataLoader for test
-        :return: DataFrame,
+        HuggingFace's BertForMaskedLM returns the loss already averaged over
+        the non-ignored (label >= 0) tokens in a batch. To get the exact
+        global mean we re-weight each batch loss by its non-ignored count.
         """
-
-        predict_res = {"prediction": [], "input": [], "label": [], "mask": []}
-
-        mean_loss = 0
         self.model.eval()
 
+        # Use float64 for the running loss sum to avoid precision drift on
+        # large test sets.
+        loss_sum  = torch.zeros((), device=self.device, dtype=torch.float64)
+        n_valid   = torch.zeros((), device=self.device, dtype=torch.long)
+        n_correct = torch.zeros((), device=self.device, dtype=torch.long)
+
         for i, batch in enumerate(data_loader):
+            data = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
-            data = {key: value.to(self.device) for key, value in batch.items()}
+            with torch.no_grad(), torch.autocast(
+                    device_type="cuda" if self._config.with_cuda else "cpu",
+                    dtype=torch.bfloat16,
+                    enabled=self._config.amp):
+                out = self.model.forward(
+                    input_ids=data["bert_input"],
+                    token_type_ids=data["methyl_seq"].long(),
+                    labels=data["bert_label"],
+                )
 
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
-                                    enabled=self._config.amp):
-                        mask_lm_output = self.model.forward(input_ids = data["input"],
-                                                        masked_lm_labels = data["label"])
+            labels = data["bert_label"]
+            valid  = labels >= 0                # (B, L) — MLM-evaluated positions
+            n_v    = valid.sum()
+            loss_sum  += out[0].detach().double() * n_v
+            n_valid   += n_v
 
-                mean_loss += mask_lm_output[0].mean().item()/len(data_loader)
-                predict_res["prediction"].append(np.argmax(mask_lm_output[1].cpu().detach(), axis=-1))
-                predict_res["input"].append(data["input"].cpu().detach())
-                predict_res["label"].append(data["label"].cpu().detach())
-                predict_res["mask"].append(data["mask"].cpu().detach())
+            preds = out[1].argmax(dim=-1)
+            n_correct += ((preds == labels) & valid).sum()
 
             if self._config.eval:
-                print("Batch %d/%d is done...."%(i, len(data_loader)))
+                print("Batch %d/%d is done...." % (i, len(data_loader)))
 
-            del mask_lm_output
-            del data
+            del out, data
 
-        # Integrate all results
-        predict_res["prediction"] = np.concatenate(predict_res["prediction"], axis=0)
-        predict_res["input"] = np.concatenate(predict_res["input"], axis=0)
-        predict_res["label"] = np.concatenate(predict_res["label"],  axis=0)
-        predict_res["mask"] = np.concatenate(predict_res["mask"],  axis=0)
+        # Three scalar reductions — effectively free.
+        if dist.is_initialized():
+            for t in (loss_sum, n_valid, n_correct):
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+        denom     = n_valid.clamp(min=1)
+        mean_loss = (loss_sum / denom).item()
+        accuracy  = (n_correct.double() / denom.double()).item()
 
         self.model.train()
-        return predict_res, np.mean(mean_loss)
-
+        return {"loss": mean_loss, "accuracy": accuracy}
 
     def _iteration(self, steps, data_loader, verbose):
         """
-        loop over the data_loader for training or testing
-        if on train status, backward operation is activated
-        and also auto save the model every epoch
-
-        :param steps: total steps to train
-        :param data_loader: torch.utils.data.DataLoader for training
-        :param warm_up: number of steps for warming up the learning rate
-        :return: None
+        Train loop. DDP-aware: rank-0-only logging/CSVs/checkpoints,
+        DistributedSampler.set_epoch each epoch, no_sync during gradient
+        accumulation, scalar all-reduce on eval metrics.
         """
-        predict_res = {"prediction": [], "input": [], "label": []}
         self.step = 0
 
-        if os.path.exists(self.f_train):
-            os.remove(self.f_train)
+        # File initialization — rank 0 only
+        if self.is_master:
+            if os.path.exists(self.f_train):
+                os.remove(self.f_train)
+            with open(self.f_train, "a") as f_perform:
+                f_perform.write("step\tloss\tacc\tlr\n")
 
-        with open(self.f_train, "a") as f_perform:
-            f_perform.write("step\tloss\tacc\tlr\n")
+            if os.path.exists(self.f_eval):
+                os.remove(self.f_eval)
+            with open(self.f_eval, "a") as f_perform:
+                f_perform.write("step\ttest_acc\ttest_loss\n")
 
-        if os.path.exists(self.f_eval):
-            os.remove(self.f_eval)
+        # LR scheduler
+        self.scheduler = learning_rate_scheduler(
+            self.optim,
+            num_warmup_steps=self._config.warmup_step,
+            num_training_steps=steps,
+            decrease_steps=self._config.decrease_steps,
+        )
 
-        with open(self.f_eval, "a") as f_perform:
-            f_perform.write("step\ttest_acc\ttest_loss\n")
-
-
-        # Set up a learning rate scheduler
-        self.scheduler = learning_rate_scheduler(self.optim,
-                                                 num_warmup_steps=self._config.warmup_step,
-                                                 num_training_steps=steps,
-                                                 decrease_steps=self._config.decrease_steps)
-
-        # Set up configuration for train iteration
         global_step_loss = 0
         local_step = 0
-
         epochs = steps // (len(data_loader) // self._config.gradient_accumulation_steps) + 1
-        self.model.zero_grad()
+        self.model.zero_grad(set_to_none=True)
         self.model.train()
-        train_prediction_res = {"prediction":[], "label":[]}
-
-        scaler = GradScaler() if self._config.amp else None
+        train_prediction_res = {"prediction": [], "label": []}
 
         duration = 0
-        for epoch in range(epochs):
-            for i, batch in enumerate(data_loader):
-                # 0. batch_data will be sent into the device(GPU or cpu)
-                data = {key: value.to(self.device) for key, value in batch.items()}
 
+        for epoch in range(epochs):
+            # Reseed the DistributedSampler each epoch for fresh shuffles
+            if hasattr(data_loader.sampler, "set_epoch"):
+                data_loader.sampler.set_epoch(epoch)
+
+            for i, batch in enumerate(data_loader):
+                data = {key: value.to(self.device, non_blocking=True) for key, value in batch.items()}
                 start = time.time()
 
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
+                                    dtype=torch.bfloat16,
                                     enabled=self._config.amp):
-                    mask_lm_output = self.model.forward(input_ids = data["bert_input"],
-                                                masked_lm_labels = data["bert_label"])
+                    mask_lm_output = self.model.forward(
+                        input_ids=data["bert_input"],
+                        token_type_ids=data["methyl_seq"].long(),
+                        labels=data["bert_label"],
+                    )
 
                 loss = mask_lm_output[0]
 
-                # Concatenate predicted sequences for the evaluation
-                train_prediction_res["prediction"].append(np.argmax(mask_lm_output[1].cpu().detach(), axis=-1))
-                train_prediction_res["label"].append(data["bert_label"].cpu().detach())
+                # Track predictions only on rank 0 (others save the cycles).
+                # argmax returns int64, which NumPy can convert; doing the argmax on-GPU
+                # also avoids moving the (B, L, vocab) bf16 logits tensor through CPU.
+                if self.is_master:
+                    train_prediction_res["prediction"].append(
+                        mask_lm_output[1].argmax(dim=-1).cpu().numpy()
+                    )
+                    train_prediction_res["label"].append(data["bert_label"].cpu().numpy())
 
-                # Calculate loss and back-propagation
                 if "cuda" in self.device.type:
                     loss = loss.mean()
-                loss = loss/self._config.gradient_accumulation_steps
-                scaler.scale(loss).backward() if self._config.amp else loss.backward()
+                loss = loss / self._config.gradient_accumulation_steps
+
+                # no_sync on non-final microbatches: skip the DDP all-reduce
+                # on intermediate accumulation steps, do it only at the boundary.
+                is_last_microbatch = (
+                    (local_step + 1) % self._config.gradient_accumulation_steps == 0
+                )
+                sync_ctx = (
+                    self.model.no_sync()
+                    if hasattr(self.model, "no_sync") and not is_last_microbatch
+                    else nullcontext()
+                )
+                with sync_ctx:
+                    loss.backward()
 
                 global_step_loss += loss.item()
                 duration += time.time() - start
 
-                # Gradient accumulation
-                if (local_step+1) % self._config.gradient_accumulation_steps == 0:
-
-                    if self._config.amp:
-                        scaler.unscale_(self.optim)
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
-                        scaler.step(self.optim)
-                        scaler.update()
-                    else:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
-                        self.optim.step()
-
+                if is_last_microbatch:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
+                    self.optim.step()
                     self.scheduler.step()
-                    self.model.zero_grad()
+                    self.model.zero_grad(set_to_none=True)
 
-                    # Evaluation with both train and testdata
-                    if self.test_data is not None and self.step % self._config.eval_freq == 0 and self.step > 0:
+                    # Eval — all ranks call _eval_iteration so the scalar
+                    # all-reduces complete; metrics are globally averaged.
+                    # Only rank 0 writes the CSV.
+                    if (self.test_data is not None
+                            and self.step % self._config.eval_freq == 0
+                            and self.step > 0):
+                        eval_metrics = self._eval_iteration(self.test_data)
+                        if self.is_master:
+                            with open(self.f_eval, "a") as f_perform:
+                                f_perform.write("\t".join([
+                                    str(self.step),
+                                    str(eval_metrics["accuracy"]),
+                                    str(eval_metrics["loss"]),
+                                ]) + "\n")
 
-                        test_pred, test_loss = self._eval_iteration(self.test_data)
-                        idces = np.where(test_pred["label"]>=0)
-                        test_pred_acc = self._acc(test_pred["prediction"][idces[0], idces[1]],
-                                                  test_pred["label"][idces[0], idces[1]])
-
-                        with open(self.f_eval, "a") as f_perform:
-                            f_perform.write("\t".join([str(self.step), str(test_pred_acc), str(test_loss)]) +"\n")
-
-                        del test_pred
-
-                    if self.step % self._config.log_freq == 0:
-                        print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
+                    # Log print — rank 0
+                    if self.is_master and self.step % self._config.log_freq == 0:
+                        print("\nTrain Step %d iter - loss : %f / lr : %f" %
+                            (self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
 
-                    if self.min_loss > global_step_loss:
-                        print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
-                        self.save(self.save_path)
-                        self.min_loss = global_step_loss
+                    # Train CSV — rank 0
+                    if self.is_master:
+                        with open(self.f_train, "a") as f_perform:
+                            train_prediction_res["prediction"] = np.concatenate(
+                                train_prediction_res["prediction"], axis=0)
+                            train_prediction_res["label"] = np.concatenate(
+                                train_prediction_res["label"], axis=0)
 
-                    # Save the step info (step, loss, lr, acc)
-                    with open(self.f_train, "a") as f_perform:
+                            idces = np.where(train_prediction_res["label"] >= 0)
+                            train_pred_acc = self._acc(
+                                train_prediction_res["prediction"][idces[0], idces[1]],
+                                train_prediction_res["label"][idces[0], idces[1]],
+                            )
 
-                        train_prediction_res["prediction"] = np.concatenate(train_prediction_res["prediction"], axis=0)
-                        train_prediction_res["label"] = np.concatenate(train_prediction_res["label"],  axis=0)
-
-                        idces = np.where(train_prediction_res["label"]>=0)
-                        train_pred_acc = self._acc(train_prediction_res["prediction"][idces[0], idces[1]],
-                            train_prediction_res["label"][idces[0], idces[1]])
-
-                        f_perform.write("\t".join([str(self.step), str(global_step_loss), str(train_pred_acc), str(self.optim.param_groups[0]["lr"])])+"\n")
+                            f_perform.write("\t".join([
+                                str(self.step), str(global_step_loss),
+                                str(train_pred_acc),
+                                str(self.optim.param_groups[0]["lr"]),
+                            ]) + "\n")
 
                     self.step += 1
 
-                    duration=0
+                    # Checkpoint — rank 0, every save_freq steps
+                    if isinstance(self._config.save_freq, int) and self.step % self._config.save_freq == 0:
+                        step_save_path = os.path.join(self.save_path, f"step_{self.step}")
+                        self.save(step_save_path)
+
+                    duration = 0
                     global_step_loss = 0
                     del train_prediction_res
-                    train_prediction_res = {"prediction":[], "label":[]}
+                    train_prediction_res = {"prediction": [], "label": []}
 
                 if steps == self.step:
                     break
-                local_step+=1
+                local_step += 1
 
             if steps == self.step:
                 break
-
 
 class MethylBertFinetuneTrainer(MethylBertTrainer):
     def __init__(self, *args, **kwargs):
@@ -412,9 +455,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         with torch.no_grad():
             for i, batch in enumerate(data_loader):
                 # 0. batch_data will be sent into the device(GPU or cpu)
-                data = {key: value.to(self.device) for key, value in batch.items() if type(value) != list}
+                data = {key: value.to(self.device, non_blocking=True) for key, value in batch.items() if type(value) != list}
 
-                with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu", enabled=self._config.amp):
+                with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
+                                    dtype=torch.bfloat16,
+                                    enabled=self._config.amp):
                     mask_lm_output = self.model.forward(step=self.step,
                                             input_ids = data["dna_seq"],
                                             token_type_ids=data["methyl_seq"],
@@ -487,13 +532,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
         epochs = steps // (len(data_loader) // self._config.gradient_accumulation_steps) + 1
 
-        self.model.zero_grad()
+        self.model.zero_grad(set_to_none=True)
         if verbose > 0:
             print(self.model.training)
         self.model.train()
         train_prediction_res = {"dmr_label":[], "pred_ctype_label":[], "ctype_label":[]}
-
-        scaler = GradScaler() if self._config.amp else None
 
         duration = 0
         epoch_progress_bar = tqdm(total=epochs, desc="Training...")
@@ -502,10 +545,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                                       desc=f"Epoch {epoch+1}/{epochs}")
             for i, batch in enumerate(data_loader):
                 # 0. batch_data will be sent into the device(GPU or cpu)
-                data = {key: value.to(self.device) for key, value in batch.items() if type(value) != list}
+                data = {key: value.to(self.device, non_blocking=True) for key, value in batch.items() if type(value) != list}
 
                 start = time.time()
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
+                                    dtype=torch.bfloat16,
                                     enabled=self._config.amp):
                     mask_lm_output = self.model.forward(step=self.step,
                                             input_ids=data["dna_seq"],
@@ -519,33 +563,28 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
 
                 # Cell-type classification
-                train_prediction_res["pred_ctype_label"].append(np.argmax(mask_lm_output["classification_logits"].cpu().detach(), axis=-1))
+                train_prediction_res["pred_ctype_label"].append(
+                    mask_lm_output["classification_logits"].argmax(dim=-1).cpu().numpy()
+                )
                 train_prediction_res["ctype_label"].append(data["ctype_label"].detach().cpu())
 
 
                 # Calculate loss and back-propagation
                 loss = mask_lm_output["loss"].mean() if "cuda" in self.device.type else mask_lm_output["loss"]
-                loss = loss/self._config.gradient_accumulation_steps
-                scaler.scale(loss).backward(retain_graph=True) if self._config.amp else loss.backward(retain_graph=True)
+                loss = loss / self._config.gradient_accumulation_steps
+                loss.backward(retain_graph=True)
 
                 loss_val = loss.item()
                 global_step_loss += loss_val
 
                 duration += time.time() - start
                 # Gradient accumulation
-                if (local_step+1) % self._config.gradient_accumulation_steps == 0:
+                if (local_step + 1) % self._config.gradient_accumulation_steps == 0:
                     gradient_accum_start = time.time()
-                    if self._config.amp:
-                        scaler.unscale_(self.optim)
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
-                        scaler.step(self.optim)
-                        scaler.update()
-                    else:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
-                        self.optim.step()
-
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self._config.max_grad_norm)
+                    self.optim.step()
                     self.scheduler.step()
-                    self.model.zero_grad()
+                    self.model.zero_grad(set_to_none=True)
 
                 if (local_step+1) % self._config.eval_freq == 0 or local_step == 0:
                     # Evaluation
@@ -703,7 +742,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
             for k, v in batch.items():
                 if type(v) != list:
-                    data[k] = v.to(self.device)
+                    data[k] = v.to(self.device, non_blocking=True)
                 if k not in res.keys():
                     res[k] = v.numpy() if type(v) == torch.Tensor else v
                 else:
@@ -718,10 +757,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                                             labels = data["dmr_label"],
                                             ctype_label=data["ctype_label"])
 
-                if "pred" in res.keys():
-                    res["pred"] = np.concatenate([res["pred"], np.argmax(mask_lm_output["classification_logits"].cpu().detach(), axis=-1)], axis=0)
+                preds = mask_lm_output["classification_logits"].argmax(dim=-1).cpu().numpy()
+                if "pred" in res:
+                    res["pred"] = np.concatenate([res["pred"], preds], axis=0)
                 else:
-                    res["pred"] = np.argmax(mask_lm_output["classification_logits"].cpu().detach(), axis=-1)
+                    res["pred"] = preds
 
                 if logit:
                     logits.append(mask_lm_output["classification_logits"].cpu().detach().numpy())
