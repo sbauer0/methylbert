@@ -76,7 +76,7 @@ test_loader = DataLoader(
 
 trainer = tr.MethylBertPretrainTrainer(
     vocab_size=len(vocab),
-    save_path="/home/bauerste/Methylbert_methylation_encoding/pretrained_model_2gpu",
+    save_path="/home/bauerste/methylbert_pretrain_without_methylatio/pretrained_model",
     train_dataloader=train_loader,
     test_dataloader=test_loader,
     lr=1e-4,

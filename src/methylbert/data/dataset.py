@@ -574,15 +574,16 @@ class MethylBertPretrainDatasetBinary(MethylBertDataset):
             torch.tensor([STATE_NON_CPG], dtype=torch.int8),
         ))
 
-        # Hide methylation at every MLM-selected position.
-        methyl_seq[masked_index] = STATE_UNKNOWN
-
-        # Reaffirm SOS and EOS positions as STATE_NON_CPG (defensive — should already
-        # hold from the cat, but masked_index could in principle touch them).
-        methyl_seq[0] = STATE_NON_CPG
-        eos_in_padded = end_pos + 2   # +1 for the EOS placement, +1 more for SOS prepend
+        # --- NO-METHYLATION ABLATION ---
+        # Overwrite the entire methylation track with STATE_UNKNOWN so the
+        # model receives zero methylation signal at every content position.
+        # This sits AFTER all upstream methylation logic so nothing leaks
+        # through: whatever was computed above is flattened here.
+        eos_in_padded = end_pos + 2   # +1 for EOS placement, +1 for SOS prepend
+        methyl_seq[:] = STATE_UNKNOWN
+        methyl_seq[0] = STATE_NON_CPG                       # SOS
         if 0 <= eos_in_padded < methyl_seq.shape[0]:
-            methyl_seq[eos_in_padded] = STATE_NON_CPG
+            methyl_seq[eos_in_padded] = STATE_NON_CPG       # EOS
 
         return {
             "bert_input": masked_dna_seq,
