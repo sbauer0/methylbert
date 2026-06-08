@@ -54,8 +54,7 @@ def _parse_line(l, headers):
 def _line2tokens_finetune(l, tokenizer, max_len=150, headers=None):
 	# parsed line!
 
-	l["dna_seq"] = l["dna_seq"].split(" ")
-	l["dna_seq"] = [[f] for f in tokenizer.to_seq(l["dna_seq"])]
+	l["dna_seq"] = [[int(f)] for f in l["dna_seq"].split(" ")]
 	l["methyl_seq"] = [int(m) for m in l["methyl_seq"]]
 
 	if len(l["dna_seq"]) > max_len:
@@ -375,14 +374,16 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		item["dna_seq"] = torch.squeeze(torch.tensor(np.array(item["dna_seq"], dtype=np.int32)))
 		item["methyl_seq"] = torch.squeeze(torch.tensor(np.array(item["methyl_seq"], dtype=np.int8)))
 
-		# Special tokens (SOS, EOS)
-		end = torch.where(item["dna_seq"]!=self.vocab.pad_index)[0].tolist()[-1] + 1 # end of the read
-		if end < item["dna_seq"].shape[0]:
-			item["dna_seq"][end] = self.vocab.eos_index
-			item["methyl_seq"][end] = 2
-		else:
-			item["dna_seq"][-1] = self.vocab.eos_index
-			item["methyl_seq"][-1] = 2
+		# Special tokens (SOS, EOS). Append a slot for EOS so a full-length
+		# window does not overwrite its last content token. Final length = seq_len + 2.
+		non_pad = torch.where(item["dna_seq"] != self.vocab.pad_index)[0]
+		end = non_pad[-1].item() + 1 if len(non_pad) > 0 else item["dna_seq"].shape[0]
+		item["dna_seq"] = torch.cat((item["dna_seq"],
+									torch.tensor([self.vocab.pad_index], dtype=item["dna_seq"].dtype)))
+		item["methyl_seq"] = torch.cat((item["methyl_seq"],
+										torch.tensor([2], dtype=item["methyl_seq"].dtype)))
+		item["dna_seq"][end] = self.vocab.eos_index
+		item["methyl_seq"][end] = 2
 		item["dna_seq"] = torch.cat((torch.tensor([self.vocab.sos_index]), item["dna_seq"]))
 		item["methyl_seq"] = torch.cat((torch.tensor([2]), item["methyl_seq"]))
 
