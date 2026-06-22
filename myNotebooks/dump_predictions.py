@@ -12,7 +12,7 @@ label/probability. Returns a DataFrame; the caller decides whether to
 .to_csv() it. Frees the GPU before returning so a loop over many models
 does not accumulate memory.
 
-Columns:methylbert
+Columns:
     read_id       read name
     dmr_label     contiguous DMR id (0..N-1)
     dmr_ctype     DMR characteristic type, 'T' or 'N'
