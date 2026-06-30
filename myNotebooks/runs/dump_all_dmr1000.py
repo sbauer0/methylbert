@@ -13,13 +13,13 @@ import traceback
 from dump_predictions import dump_predictions
 
 DMR_TOTAL  = 1000
-MODEL_BASE = "/workspace/methylbert_finetune"
-OUT_DIR    = f"/workspace/predictions{DMR_TOTAL}"
+MODEL_BASE = "/home/bauerste/methylbert_finetune"
+OUT_DIR    = f"/home/bauerste/methylbert_finetune/predictions{DMR_TOTAL}"
 
 SPLITS = {
-    "train": f"/workspace/finetuneDatasets/dmr{DMR_TOTAL}/train_seq.csv",      # run-1 train
-    "eval":  f"/workspace/finetuneDatasets/dmr{DMR_TOTAL}/test_seq.csv",       # run-1 15% eval
-    "test":  f"/workspace/finetuneTestdata/dmr{DMR_TOTAL}_test/data.csv",      # run-2 held-out
+    "train": f"/tmp/bauerste/finetuneDatasets/dmr{DMR_TOTAL}/train_seq.csv",      # run-1 train
+    "eval":  f"/tmp/bauerste/finetuneDatasets/dmr{DMR_TOTAL}/test_seq.csv",       # run-1 15% eval
+    "test":  f"/tmp/bauerste/finetuneDatasets/dmr{DMR_TOTAL}_test/data.csv",      # run-2 held-out
 }
 
 VARIANTS = ("w_methylation", "wo_methylation")

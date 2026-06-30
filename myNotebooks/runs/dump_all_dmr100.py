@@ -13,14 +13,14 @@ import os
 import traceback
 from dump_predictions import dump_predictions
 
-MODEL_BASE = "/workspace/methylbert_finetune"
-OUT_DIR    = "/workspace/predictions"
+MODEL_BASE = "/home/bauerste/methylbert_finetune"
+OUT_DIR    = "/home/bauerste/methylbert_finetune/predictions"
 
 # split -> data csv
 SPLITS = {
-    "train": "/workspace/finetuneDatasets/dmr100/train_seq.csv",  # run-1 train
-    "eval":  "/workspace/finetuneDatasets/dmr100/test_seq.csv",   # run-1 15% eval split
-    "test":  "/workspace/finetuneTestdata/dmr100_test/data.csv",  # run-2 held-out test
+    "train": "/tmp/bauerste/finetuneDatasets/dmr100/train_seq.csv",  # run-1 train
+    "eval":  "/tmp/bauerste/finetuneDatasets/dmr100/test_seq.csv",   # run-1 15% eval split
+    "test":  "/tmp/bauerste/finetuneDatasets/dmr100_test/data.csv",  # run-2 held-out test
 }
 
 MODELS = [

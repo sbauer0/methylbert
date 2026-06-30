@@ -10,19 +10,19 @@ Run:  nohup python finetune_dmr250.py > ft_dmr250.log 2>&1 & ; tail -f ft_dmr250
 import os, sys, argparse, subprocess
 
 DMR_TOTAL = 250
-DATA_DIR  = f"/workspace/finetuneDatasets/dmr{DMR_TOTAL}/"
+DATA_DIR  = f"/tmp/bauerste/finetuneDatasets/dmr{DMR_TOTAL}/"
 TRAIN_CSV = os.path.join(DATA_DIR, "train_seq.csv")
 EVAL_CSV  = os.path.join(DATA_DIR, "test_seq.csv")   # 15% eval split (NOT run-2)
-OUT_BASE  = "/workspace/methylbert_finetune"
+OUT_BASE  = "/home/bauerste/methylbert_finetune"
 
-PRETRAINED_W  = "/workspace/methylbert_pretrain_with_methylation/pretrained_model_120k_512_w_methylation/step_120000"
-PRETRAINED_WO = "/workspace/methylbert_pretrain_without_methylation/pretrained_model_120k_512_wo_methylation/step_120000"
+PRETRAINED_W  = "/home/bauerste/methylbert_pretrain_with_methylation/pretrained_model_120k_512_w_methylation/step_120000"
+PRETRAINED_WO = "/home/bauerste/methylbert_pretrain_without_methylation/pretrained_model_120k_512_wo_methylation/step_120000"
 
 SEED = 42
 SEQ_LEN, N_MERS              = 511, 3
 BATCH, GRAD_ACCUM, NUM_WORKERS = 32, 2, 8
-LR, WARMUP, DECREASE_STEPS   = 1e-4, 100, 300
-EVAL_FREQ, STEPS, LOSS       = 25, 1000, "bce"
+LR, WARMUP, DECREASE_STEPS   = 1e-4, 30, 100
+EVAL_FREQ, STEPS, LOSS       = 15, 300, "bce"
 
 RUNS = [
     (PRETRAINED_W,  "w_methylation",  SEED),

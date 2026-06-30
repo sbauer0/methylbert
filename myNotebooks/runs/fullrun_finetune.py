@@ -9,7 +9,7 @@ Run detached:
 """
 import os, sys, argparse, subprocess
 
-DATA_DIR  = "/tmp/bauerste/dmr100/"
+DATA_DIR  = "/tmp/bauerste/finetuneDatasets/dmr100/"
 TRAIN_CSV = os.path.join(DATA_DIR, "train_seq.csv")
 EVAL_CSV  = os.path.join(DATA_DIR, "test_seq.csv")   # 15% eval split (NOT run-2 test)
 OUT_BASE  = "/home/bauerste/methylbert_finetune"
@@ -19,8 +19,8 @@ PRETRAINED_WO = "/home/bauerste/methylbert_pretrain_without_methylation/pretrain
 
 SEQ_LEN, N_MERS              = 511, 3
 BATCH, GRAD_ACCUM, NUM_WORKERS = 32, 2, 8
-LR, WARMUP, DECREASE_STEPS   = 1e-4, 100, 300
-EVAL_FREQ, STEPS, LOSS       = 25, 1000, "bce"
+LR, WARMUP, DECREASE_STEPS   = 1e-4, 30, 100
+EVAL_FREQ, STEPS, LOSS       = 15, 300, "bce"
 
 # (pretrained_path, variant_tag, seed)
 RUNS = []

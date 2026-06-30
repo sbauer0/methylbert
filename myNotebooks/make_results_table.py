@@ -15,12 +15,12 @@ BASE_TEST  = os.path.join(HOME, "finetuneTestdata/dmr100_test/data.csv")
 # (model, seed, best-checkpoint step, best eval loss)  -- read off the fine-tuning figure
 # prediction tag is built as preds_s{seed}_{w|wo}_methylation_test.csv
 MODELS = [
-    ("Methylation-aware", 42,  974, 0.403, "w"),
-    ("Methylation-aware", 67,  849, 0.409, "w"),
-    ("Methylation-aware", 123, 574, 0.424, "w"),
-    ("Ablation",          42,  199, 0.493, "wo"),
-    ("Ablation",          67,  749, 0.432, "wo"),
-    ("Ablation",          123, 274, 0.492, "wo"),
+    ("Methylation-aware", 42,  299, 0.048, "w"),
+    ("Methylation-aware", 67,  284, 0.046, "w"),
+    ("Methylation-aware", 123, 239, 0.049, "w"),
+    ("Ablation",          42,  284, 0.061, "wo"),
+    ("Ablation",          67,  254, 0.076, "wo"),
+    ("Ablation",          123, 164, 0.072, "wo"),
 ]
 
 def test_metrics(seed, wtag):

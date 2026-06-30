@@ -15,17 +15,19 @@ from methylbert.data.finetune_data_generate import finetune_data_generate
 from methylbert.data.nanopore.finetune_extract import ont_read_extract
 
 HOME    = "/home/bauerste"
-DMRS    = f"{HOME}/finetuneDatasets/dmrs_no_id_NMS.tsv"
+DMRS    = f"{HOME}/methylbertDMRs/dmrs_filtered.tsv"
 REF     = f"{HOME}/GRCh38_no_alt_analysis_set/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna"
 TRAINDIR = f"{HOME}/finetuneDatasets"
 TESTDIR  = f"{HOME}/finetuneTestdata"
 
-# run-1 = PAU5* (train/eval), run-2 = PAU6* (test)
-RUN1 = [("/tmp/bauerste/colo829/PAU59949.d052sup4305mCG_5hmCGvHg38_pass.bam", "T"),
-        ("/tmp/bauerste/colo829bl/PAU59807.d052sup4305mCG_5hmCGvHg38_pass.bam", "N")]
-RUN2 = [("/tmp/bauerste/colo829/PAU61426.d052sup4305mCG_5hmCGvHg38_pass.bam", "T"),
-        ("/tmp/bauerste/colo829bl/PAU61427.d052sup4305mCG_5hmCGvHg38_pass.bam", "N")]
 
+# run-1 = PAU5* (train/eval), run-2 = PAU6* (test)
+RUN1 = [("/tmp/bauerste/COLO829_BL/colo829/PAU59949.d052sup4305mCG_5hmCGvHg38_pass.bam", "T"),
+        ("/tmp/bauerste/COLO829_BL/colo829bl/PAU59807.d052sup4305mCG_5hmCGvHg38_pass.bam", "N")]
+RUN2 = [("/tmp/bauerste/COLO829_BL/colo829/PAU61426.d052sup4305mCG_5hmCGvHg38_pass.bam", "T"),
+        ("/tmp/bauerste/COLO829_BL/colo829bl/PAU61427.d052sup4305mCG_5hmCGvHg38_pass.bam", "N")]
+
+os.makedirs(TRAINDIR, exist_ok=True)
 os.makedirs(TESTDIR, exist_ok=True)
 
 def write_sc(path, bams):
